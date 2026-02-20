@@ -11,6 +11,87 @@ Unreleased changes are in [CHANGELOG.unreleased.md](CHANGELOG.unreleased.md).
 
 <!-- tools/changelog.py: insert here -->
 
+## [0.25.0] - 2026-02-12
+
+### Notable Changes
+
+This version drops support for Python 3.8.
+
+### Added
+
+- Multi-run workspace experience in W&B LEET TUI (`wandb beta leet` command). (@dmitryduev in https://github.com/wandb/wandb/pull/11299)
+- Config editor for W&B LEET TUI (`wandb beta leet config` command). (@dmitryduev in https://github.com/wandb/wandb/pull/11327)
+- `owner` property on `wandb.apis.public.Project` to access the project owner's user information. (@jacobromero in https://github.com/wandb/wandb/pull/11278)
+
+### Changed
+
+- Python 3.8 is no longer supported (@tonyyli-wandb in https://github.com/wandb/wandb/pull/11198, https://github.com/wandb/wandb/pull/11290, https://github.com/wandb/wandb/pull/11164)
+
+### Fixed
+
+- Sweep agents now exit gracefully when the sweep is deleted, instead of running indefinitely with repeated 404 errors (@domphan-wandb in https://github.com/wandb/wandb/pull/11226)
+- `wandb-core` crashes no longer produce extremely long, repetitive tracebacks in older Python versions (@timoffex in https://github.com/wandb/wandb/pull/11284)
+- TensorBoard sync no longer stops after 1 MB of data (@timoffex in https://github.com/wandb/wandb/pull/11334)
+  - Regression introduced in 0.24.0
+
+## [0.24.2] - 2026-02-04
+
+### Added
+
+- wandb.Api() now supports Federated Auth (JWT based authentication). (@ryanbuccellato in https://github.com/wandb/wandb/pull/11243)
+
+### Fixed
+
+- Refresh presigned download url when it expires during artifact file downloads. (@pingleiwandb in https://github.com/wandb/wandb/pull/11242)
+
+## [0.24.1] - 2026-01-29
+
+### Notable Changes
+
+Runs created with `wandb==0.24.0` may fail to upload some data, which this release fixes. Missing data is stored in the run's `.wandb` file and can be reuploaded with `wandb sync`.
+
+### Added
+
+- `download_history_exports` in `api.Run` class to download exported run history in parquet file format (@jacobromero in https://github.com/wandb/wandb/pull/11094)
+
+### Changed
+
+- When a settings file (such as `./wandb/settings` or `~/.config/wandb/settings`) contains an invalid setting, all settings files are ignored and an error is printed (@timoffex in https://github.com/wandb/wandb/pull/11207)
+
+### Fixed
+
+- After `wandb login --host <invalid-url>`, using `wandb login --host <valid-url>` works as usual (@timoffex in https://github.com/wandb/wandb/pull/11207)
+  - Regression introduced in 0.24.0
+- `wandb beta sync` correctly loads credentials (@timoffex in https://github.com/wandb/wandb/pull/11231)
+  - Regression introduced in 0.24.0
+  - Caused `wandb beta sync` to get stuck on `Syncing...`
+- Fixed occasional unuploaded data in 0.24.0 (@timoffex in https://github.com/wandb/wandb/pull/11249)
+  - All data is stored in the run's `.wandb` file and can be reuploaded with `wandb sync`
+
+## [0.24.0] - 2026-01-13
+
+### Notable Changes
+
+This version removes the legacy, deprecated `wandb.beta.workflows` module, including its `log_model()`/`use_model()`/`link_model()` functions. This is formally a breaking change.
+
+### Added
+
+- `wandb agent` and `wandb.agent()` now accept a `forward_signals` flag (CLI: `--forward-signals/-f`) to relay SIGINT/SIGTERM and other catchable signals from the agent to its sweep child runs, enabling cleaner shutdowns when you interrupt an agent process (@kylegoyette, @domphan-wandb in https://github.com/wandb/wandb/pull/9651)
+- `wandb beta sync` now supports a `--live` option for syncing a run while it's being logged (@timoffex in https://github.com/wandb/wandb/pull/11079)
+
+### Removed
+
+- Removed the deprecated `wandb.beta.workflows` module, including its `log_model()`, `use_model()`, and `link_model()` functions, and whose modern successors are the `Run.log_artifact`, `Run.use_artifact`, and `Run.link_artifact` methods, respectively (@tonyyli-wandb in [TODO: PR link])
+
+### Fixed
+
+- Fixed `Run.__exit__` type annotations to accept `None` values, which are passed when no exception is raised (@moldhouse in https://github.com/wandb/wandb/pull/11100)
+- Fixed `Invalid Client ID digest` error when creating artifacts after calling `random.seed()`. Client IDs could collide when random state was seeded deterministically. (@pingleiwandb in https://github.com/wandb/wandb/pull/11039)
+- Fixed CLI error when listing empty artifacts (@ruhiparvatam in https://github.com/wandb/wandb/pull/11157)
+- Fixed regression for calling `api.run()` on a Sweeps run (@willtryagain in https://github.com/wandb/wandb/pull/11088 and @kelu-wandb in https://github.com/wandb/wandb/pull/11097)
+- Fixed the "View run at" message printed at the end of a run which sometimes did not include a URL (@timoffex in https://github.com/wandb/wandb/pull/11113)
+- Runs queried from wandb.Api() now display a string representation in VSCode notebooks instead of a broken HTML window (@jacobromero in https://github.com/wandb/wandb/pull/11040)
+
 ## [0.23.1] - 2025-12-03
 
 ### Added

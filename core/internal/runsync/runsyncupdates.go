@@ -1,6 +1,8 @@
 package runsync
 
-import spb "github.com/wandb/wandb/core/pkg/service_go_proto"
+import (
+	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
+)
 
 // RunSyncUpdates contains the updates to apply to a run when syncing it.
 //
@@ -10,23 +12,25 @@ type RunSyncUpdates struct {
 	//
 	// Empty strings indicate no update.
 	Entity, Project, RunID string
+
+	// JobType is the new job type for the run if it's not empty.
+	JobType string
+
+	// TagReplacements is a map from old tag names to new ones.
+	//
+	// Mapping a tag to an empty string deletes it.
+	TagReplacements map[string]string
 }
 
 // UpdatesFromRequest constructs RunSyncUpdates from a sync init request.
 func UpdatesFromRequest(request *spb.ServerInitSyncRequest) *RunSyncUpdates {
-	u := &RunSyncUpdates{}
-
-	if entity := request.GetNewEntity(); len(entity) > 0 {
-		u.Entity = entity
+	return &RunSyncUpdates{
+		Entity:          request.GetNewEntity(),
+		Project:         request.GetNewProject(),
+		RunID:           request.GetNewRunId(),
+		JobType:         request.GetNewJobType(),
+		TagReplacements: request.GetTagReplacements(),
 	}
-	if project := request.GetNewProject(); len(project) > 0 {
-		u.Project = project
-	}
-	if runID := request.GetNewRunId(); len(runID) > 0 {
-		u.RunID = runID
-	}
-
-	return u
 }
 
 // Modify updates a record with modifications requested for syncing.
@@ -36,16 +40,33 @@ func (u *RunSyncUpdates) Modify(record *spb.Record) {
 	}
 
 	if run := record.GetRun(); run != nil {
-		if len(u.Entity) > 0 {
+		if u.Entity != "" {
 			run.Entity = u.Entity
 		}
 
-		if len(u.Project) > 0 {
+		if u.Project != "" {
 			run.Project = u.Project
 		}
 
-		if len(u.RunID) > 0 {
+		if u.RunID != "" {
 			run.RunId = u.RunID
 		}
+
+		if u.JobType != "" {
+			run.JobType = u.JobType
+		}
+
+		newTags := make([]string, 0, len(run.Tags))
+		for _, oldTag := range run.Tags {
+			newTag, replaced := u.TagReplacements[oldTag]
+
+			switch {
+			case !replaced:
+				newTags = append(newTags, oldTag)
+			case newTag != "":
+				newTags = append(newTags, newTag)
+			}
+		}
+		run.Tags = newTags
 	}
 }

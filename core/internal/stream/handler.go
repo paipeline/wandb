@@ -12,6 +12,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"github.com/google/wire"
+
 	"github.com/wandb/wandb/core/internal/filetransfer"
 	"github.com/wandb/wandb/core/internal/fileutil"
 	"github.com/wandb/wandb/core/internal/gitops"
@@ -163,13 +164,9 @@ func (h *Handler) OutChan() <-chan runwork.Work {
 //gocyclo:ignore
 func (h *Handler) Do(allWork <-chan runwork.Work) {
 	defer h.logger.Reraise()
-	h.logger.Info("handler: started", "stream_id", h.settings.GetRunID())
+	h.logger.Info("handler: started")
 	for work := range allWork {
-		h.logger.Debug(
-			"handler: got work",
-			"work", work,
-			"stream_id", h.settings.GetRunID(),
-		)
+		h.logger.Debug("handler: got work", "work", work)
 
 		if work.Accept(h.handleRecord) {
 			h.fwdWork(work)
@@ -179,7 +176,7 @@ func (h *Handler) Do(allWork <-chan runwork.Work) {
 }
 
 func (h *Handler) Close() {
-	h.logger.Info("handler: closed", "stream_id", h.settings.GetRunID())
+	h.logger.Info("handler: closed")
 	close(h.outChan)
 	close(h.fwdChan)
 }
@@ -388,7 +385,7 @@ func (h *Handler) handleMetric(record *spb.Record) {
 		return
 	}
 
-	if len(metric.Name) > 0 {
+	if metric.Name != "" {
 		// TODO: Add !h.settings.IsEnableServerSideDerivedSummary() to the condition
 		// once we support server-side derived summary aggregation (min, max, mean, etc.)
 		h.metricHandler.UpdateSummary(metric.Name, h.runSummary)
@@ -569,7 +566,8 @@ func (h *Handler) handleCodeSave() {
 	}
 
 	codeDir := filepath.Join(h.settings.GetFilesDir(), "code")
-	if err := os.MkdirAll(filepath.Join(codeDir, filepath.Dir(programRelative)), os.ModePerm); err != nil {
+	programPath := filepath.Join(codeDir, filepath.Dir(programRelative))
+	if err := os.MkdirAll(programPath, os.ModePerm); err != nil {
 		return
 	}
 	savedProgram := filepath.Join(codeDir, programRelative)

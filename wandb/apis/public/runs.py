@@ -36,14 +36,17 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 import tempfile
 import time
 import urllib
-from typing import TYPE_CHECKING, Any, Collection, Iterator, Literal, Mapping
+from collections.abc import Collection, Iterator, Mapping
+from typing import TYPE_CHECKING, Any, Literal
 
 from wandb_gql import gql
 
 import wandb
+import wandb.apis.public.runhistory as runhistory
 from wandb import env, util
 from wandb._strutils import nameof
 from wandb.apis import public
@@ -52,8 +55,11 @@ from wandb.apis.internal import Api as InternalApi
 from wandb.apis.normalize import normalize_exceptions
 from wandb.apis.paginator import SizedPaginator
 from wandb.apis.public.const import RETRY_TIMEDELTA
+from wandb.proto import wandb_api_pb2 as apb
+from wandb.sdk import wandb_setup
 from wandb.sdk.lib import ipython, json_util, runid
 from wandb.sdk.lib.paths import LogicalPath
+from wandb.sdk.lib.service.service_connection import WandbApiFailedError
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -622,7 +628,49 @@ class Run(Attrs):
         entity: str | None = None,
         state: Literal["running", "pending"] = "running",
     ) -> Self:
-        """Create a run for the given project."""
+        """Create a run for the given project.
+
+        For most use cases, use `wandb.init()`. `wandb.init()` provides more robust
+        logic for creating and updating runs. `wandb.apis.public.Run.create`
+        is intended for specific scenarios such as creating runs in
+        a "pending" state for jobs that may be unschedulable
+        (for example, in a Kubernetes cluster with insufficient GPUs or high
+        contention). These pending runs can later be resumed and tracked by W&B.
+
+        Runs created with this method have limited functionality. Calling
+        `update()` on a run created this way may not work as expected.
+
+        Args:
+            api: The W&B API instance.
+            run_id: Optional run ID. If not provided, a random ID will be generated.
+            project: Optional project name. Defaults to the project in API settings
+                or "uncategorized".
+            entity: Optional entity (user or team) name.
+            state: Initial state of the run. Use "pending" for runs that will be
+                resumed later, or "running" for immediate execution.
+
+        Returns:
+            A Run object representing the created run.
+
+        Example:
+        Creating a pending run for later execution
+
+        ```python
+        import wandb
+
+        api = wandb.Api()
+
+        run_name = "my-pending-run"
+
+        run = Run.create(
+            api=api,
+            project="project",
+            entity="entity",
+            state="pending",
+            run_id=run_name,
+        )
+        ```
+        """
         api._sentry.message("Invoking Run.create", level="info")
         run_id = run_id or runid.generate_id()
         project = project or api.settings.get("project") or "uncategorized"
@@ -757,7 +805,7 @@ class Run(Attrs):
         # Only check for sweeps if sweep_name is available (not in lazy mode or if it exists)
         if self._include_sweeps and self._attrs.get("sweepName") and not self.sweep:
             # There may be a lot of runs. Don't bother pulling them all
-            self.sweep = public.Sweep(
+            self.sweep = public.Sweep.get(
                 self.client,
                 self.entity,
                 self.project,
@@ -883,6 +931,64 @@ class Run(Attrs):
     def save(self) -> None:
         """Persist changes to the run object to the W&B backend."""
         self.update()
+
+    @normalize_exceptions
+    def update_state(self, state: Literal["pending"]) -> bool:
+        """Update the state of a run.
+
+        Allows transitioning runs from 'failed' or 'crashed' to 'pending'.
+
+        Args:
+            state: The target run state. Only `"pending"` is supported.
+
+        Returns:
+            `True` if the state was successfully updated.
+
+        Raises:
+            `wandb.Error`: If the requested state transition is not allowed, or the server
+                does not support this operation.
+        """
+        mutation = gql(
+            """
+            mutation UpdateRunState($input: UpdateRunStateInput!) {
+                updateRunState(input: $input) {
+                    success
+                }
+            }
+            """
+        )
+
+        try:
+            result = self.client.execute(
+                mutation,
+                variable_values={
+                    "input": {
+                        "id": self.storage_id,
+                        "state": state,
+                    }
+                },
+            )
+        except Exception as e:
+            error_msg = str(e)
+            if "UpdateRunStateInput" in error_msg or "updateRunState" in error_msg:
+                raise wandb.Error(
+                    "The server does not support the update_state operation. "
+                    "Please ensure your W&B server is updated to a version that "
+                    "supports run state transitions."
+                ) from e
+            if "invalid state transition" in error_msg.lower():
+                raise wandb.Error(
+                    f"Invalid state transition: cannot change run from '{self.state}' "
+                    f"to '{state}'. Only runs in 'failed' or 'crashed' state can be "
+                    "transitioned to 'pending'."
+                ) from e
+            raise
+
+        if result.get("updateRunState", {}).get("success"):
+            self._attrs["state"] = state
+            self._state = state
+            return True
+        return False
 
     @property
     def json_config(self) -> str:
@@ -1439,7 +1545,7 @@ class Run(Attrs):
         ):
             return -1
         history_keys = response["project"]["run"]["historyKeys"]
-        return history_keys["lastStep"] if "lastStep" in history_keys else -1
+        return history_keys.get("lastStep", -1)
 
     def to_html(self, height: int = 420, hidden: bool = False) -> str:
         """Generate HTML containing an iframe displaying this run."""
@@ -1452,9 +1558,17 @@ class Run(Attrs):
         return prefix + f"<iframe src={url!r} style={style!r}></iframe>"
 
     def _repr_html_(self) -> str:
+        if ipython.in_vscode_notebook():
+            import html
+
+            return html.escape(self._string_representation())
+
         return self.to_html()
 
     def __repr__(self) -> str:
+        return self._string_representation()
+
+    def _string_representation(self) -> str:
         return f"<{nameof(type(self))} {'/'.join(self.path)} ({self.state})>"
 
     def beta_scan_history(
@@ -1498,3 +1612,65 @@ class Run(Attrs):
             use_cache=use_cache,
         )
         return beta_history_scan
+
+    def download_history_exports(
+        self,
+        download_dir: pathlib.Path | str,
+        require_complete_history: bool = True,
+    ) -> runhistory.DownloadHistoryResult:
+        """Download any parquet history files for the run to the provided directory.
+
+        Args:
+            download_dir: The directory to download the history files to.
+            require_complete_history: Whether to require the complete history to be downloaded.
+                If true, and the run contains data that has not been exported to parquet files yet,
+                an IncompleteRunHistoryError will be raised.
+
+        Returns:
+            A DownloadHistoryResult.
+
+        Raises:
+            IncompleteRunHistoryError: If require_complete_history is True
+                and the run contains data not yet exported to parquet files.
+            WandbApiFailedError: If the API request fails for reasons other than
+                incomplete history.
+        """
+        if self._api is None:
+            self._api: public.Api = public.Api()
+
+        init_download_request = apb.DownloadRunHistoryInit(
+            entity=self.entity,
+            project=self.project,
+            run_id=self.id,
+            download_dir=str(download_dir),
+            require_complete_history=require_complete_history,
+        )
+        api_request = apb.ApiRequest(
+            read_run_history_request=apb.ReadRunHistoryRequest(
+                download_run_history_init=init_download_request,
+            )
+        )
+
+        response: apb.ApiResponse
+        try:
+            response = self._api._send_api_request(api_request)
+        except WandbApiFailedError as e:
+            if (
+                e.response is not None
+                and e.response.error_type == apb.ErrorType.INCOMPLETE_RUN_HISTORY_ERROR
+            ):
+                raise runhistory.IncompleteRunHistoryError() from None
+            else:
+                raise WandbApiFailedError("Failed to download history") from e
+
+        contains_live_data = response.read_run_history_response.download_run_history_init.contains_live_data
+        request_id = (
+            response.read_run_history_response.download_run_history_init.request_id
+        )
+        return wandb_setup.singleton().asyncer.run(
+            lambda: runhistory.wait_for_download_with_progress(
+                self._api,
+                request_id,
+                contains_live_data,
+            )
+        )

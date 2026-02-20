@@ -1,4 +1,4 @@
-// W&B backend API.
+// Package api implements an enhanced HTTP client for wandb-core.
 package api
 
 import (
@@ -9,7 +9,9 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-retryablehttp"
+
 	"github.com/wandb/wandb/core/internal/clients"
+	"github.com/wandb/wandb/core/internal/httplayers"
 )
 
 const (
@@ -34,85 +36,29 @@ const (
 // WBBaseURL is the address of the W&B backend, like https://api.wandb.ai.
 type WBBaseURL *url.URL
 
-// The W&B backend server.
-//
-// There is generally exactly one Backend and a small number of Clients in a
-// process.
-type Backend struct {
-	// The URL prefix for all requests to the W&B API.
-	baseURL *url.URL
-
-	// The logger to use for HTTP-related logs.
-	//
-	// Note that these are only useful for debugging, and not helpful to a
-	// user. There's no guarantee that all logs are made at the Debug level.
-	logger *slog.Logger
-
-	// Credentials to apply for backend requests.
-	credentialProvider CredentialProvider
-}
-
-// A retrying HTTP client with special handling for the W&B backend.
-//
-// There is one Client per API provided by the backend, where "API" is a
-// collection of related HTTP endpoints. It's expected that different APIs
-// have different properties such as rate-limits and ideal retry behaviors.
+// RetryableClient is an HTTP client with retries and special handling for W&B.
 //
 // The client is responsible for setting auth headers, retrying
 // gracefully, and respecting rate-limit response headers.
-type Client interface {
+type RetryableClient interface {
 	// Sends an HTTP request with retries.
 	//
 	// There is special handling if the request is for the W&B backend.
 	//
 	// It is guaranteed that the response is non-nil unless there is an error.
-	Do(*http.Request) (*http.Response, error)
-}
-
-type RetryableClient interface {
 	Do(*retryablehttp.Request) (*http.Response, error)
 }
 
-// Implementation of the Client interface.
+// clientImpl implements the RetryableClient interface.
 type clientImpl struct {
-	// A reference to the backend.
-	backend *Backend
-
-	// The underlying retryable HTTP client.
-	retryableHTTP RetryableClient
-
-	// Headers to pass in every request.
-	extraHeaders map[string]string
-
-	// Credentials to apply on every request.
-	credentialProvider CredentialProvider
-}
-
-type BackendOptions struct {
-	// The scheme and hostname for contacting the server, not including a final
-	// slash. For example, "http://localhost:8080".
-	BaseURL WBBaseURL
-
-	// Logger for HTTP operations.
-	Logger *slog.Logger
-
-	// Credentials to apply on every request.
-	CredentialProvider CredentialProvider
-}
-
-// Creates a [Backend].
-//
-// The `baseURL` is the scheme and hostname for contacting the server, not
-// including a final slash. Example "http://localhost:8080".
-func New(opts BackendOptions) *Backend {
-	return &Backend{
-		baseURL:            opts.BaseURL,
-		logger:             opts.Logger,
-		credentialProvider: opts.CredentialProvider,
-	}
+	retryableHTTP RetryableClient // underlying HTTP client
+	logger        *slog.Logger
 }
 
 type ClientOptions struct {
+	// BaseURL is the URL for the W&B server.
+	BaseURL *url.URL
+
 	// Maximum number of retries to make for retryable requests.
 	RetryMax int
 
@@ -172,53 +118,40 @@ type ClientOptions struct {
 	// Function that gets called before the retry operation and prepares the
 	// request for retry
 	PrepareRetry func(*http.Request) error
+
+	Logger *slog.Logger
 }
 
-// Creates a new [Client] for making requests to the [Backend].
-func (backend *Backend) NewClient(opts ClientOptions) Client {
+// NewClient returns a new [RetryableClient] for making HTTP requests.
+func NewClient(opts ClientOptions) RetryableClient {
+	if opts.BaseURL == nil {
+		panic("api: nil BaseURL")
+	}
+
 	retryableHTTP := retryablehttp.NewClient()
 	retryableHTTP.Backoff = clients.ExponentialBackoffWithJitter
 	retryableHTTP.RetryMax = opts.RetryMax
 	retryableHTTP.RetryWaitMin = opts.RetryWaitMin
 	retryableHTTP.RetryWaitMax = opts.RetryWaitMax
 	retryableHTTP.HTTPClient.Timeout = opts.NonRetryTimeout
-
-	// Set the PrepareRetry function on the client
-	prepareRetry := opts.PrepareRetry
-	if prepareRetry == nil {
-		prepareRetry = func(req *http.Request) error {
-			return backend.credentialProvider.Apply(req)
-		}
-	}
-	retryableHTTP.PrepareRetry = prepareRetry
+	retryableHTTP.PrepareRetry = opts.PrepareRetry
 
 	// Set the retry policy with debug logging if possible.
 	retryPolicy := opts.RetryPolicy
 	if retryPolicy == nil {
 		retryPolicy = retryablehttp.DefaultRetryPolicy
 	}
-	if backend.logger != nil {
-		retryPolicy = withRetryLogging(retryPolicy, backend.logger)
+	if opts.Logger != nil {
+		retryPolicy = withRetryLogging(retryPolicy, opts.Logger)
 	}
 	retryableHTTP.CheckRetry = retryPolicy
 
 	// Let the client log debug messages.
-	if backend.logger != nil {
+	if opts.Logger != nil {
 		retryableHTTP.Logger = slog.NewLogLogger(
-			backend.logger.Handler(),
+			opts.Logger.Handler(),
 			slog.LevelDebug,
 		)
-	}
-
-	// PrepareRetry gets called before the retry attempt
-	retryableHTTP.PrepareRetry = func(req *http.Request) error {
-		if opts.PrepareRetry != nil {
-			if err := opts.PrepareRetry(req); err != nil {
-				return err
-			}
-		}
-		// credentials can expire, so ensure retries have fresh credentials
-		return backend.credentialProvider.Apply(req)
 	}
 
 	// Set the Proxy function on the HTTP client.
@@ -242,16 +175,27 @@ func (backend *Backend) NewClient(opts ClientOptions) Client {
 		}
 	}
 
+	extraHeaders := make(http.Header, len(opts.ExtraHeaders)+1)
+	extraHeaders.Set("User-Agent", "wandb-core")
+	for header, value := range opts.ExtraHeaders {
+		extraHeaders.Set(header, value)
+	}
+
+	wandbOnlyLayers := httplayers.LimitTo(opts.BaseURL, httplayers.Concat(
+		opts.CredentialProvider,
+		httplayers.ExtraHeaders(extraHeaders),
+		ResponseBasedRateLimiter(),
+	))
+
 	retryableHTTP.HTTPClient.Transport =
-		NewPeekingTransport(
-			opts.NetworkPeeker,
-			NewRateLimitedTransport(transport),
-		)
+		httplayers.WrapRoundTripper(transport,
+			httplayers.Concat(
+				NetworkPeeker(opts.NetworkPeeker),
+				wandbOnlyLayers,
+			))
 
 	return &clientImpl{
-		backend:            backend,
-		retryableHTTP:      retryableHTTP,
-		extraHeaders:       opts.ExtraHeaders,
-		credentialProvider: opts.CredentialProvider,
+		retryableHTTP: retryableHTTP,
+		logger:        opts.Logger,
 	}
 }

@@ -4,7 +4,9 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+
 	"github.com/wandb/wandb/core/internal/observabilitytest"
+	"github.com/wandb/wandb/core/internal/runhandle"
 	"github.com/wandb/wandb/core/internal/runwork"
 	"github.com/wandb/wandb/core/internal/runworktest"
 	"github.com/wandb/wandb/core/internal/stream"
@@ -17,7 +19,7 @@ func newUnsavedWork(value string) runwork.MaybeSavedWork {
 	}
 }
 
-func newSavedWork(value string, num int64, offset int64) runwork.MaybeSavedWork {
+func newSavedWork(value string, num, offset int64) runwork.MaybeSavedWork {
 	return runwork.MaybeSavedWork{
 		Work:         &runworktest.NoopWork{Value: value},
 		IsSaved:      true,
@@ -30,7 +32,7 @@ func TestUnsavedWork_HeldInMemory(t *testing.T) {
 	buf := stream.NewFlowControlBuffer(stream.FlowControlParams{
 		InMemorySize: 10,
 		Limit:        10,
-	}, observabilitytest.NewTestLogger(t))
+	}, observabilitytest.NewTestLogger(t), runhandle.New())
 
 	buf.Add(newUnsavedWork("item 1"))
 
@@ -42,7 +44,7 @@ func TestSavedWork_HeldInMemoryThenOffloaded(t *testing.T) {
 	buf := stream.NewFlowControlBuffer(stream.FlowControlParams{
 		InMemorySize: 2,
 		Limit:        10,
-	}, observabilitytest.NewTestLogger(t))
+	}, observabilitytest.NewTestLogger(t), runhandle.New())
 
 	buf.Add(newSavedWork("saved 1", 1, 10))
 	buf.Add(newSavedWork("saved 2", 2, 20))
@@ -63,7 +65,7 @@ func TestStopOffloading_PreventsOffloading(t *testing.T) {
 	buf := stream.NewFlowControlBuffer(stream.FlowControlParams{
 		InMemorySize: 0,
 		Limit:        10,
-	}, observabilitytest.NewTestLogger(t))
+	}, observabilitytest.NewTestLogger(t), runhandle.New())
 
 	buf.Add(newSavedWork("saved 1", 1, 10))
 	buf.StopOffloading()
@@ -79,7 +81,7 @@ func TestNonConsecutiveSavedWork_DifferentChunks(t *testing.T) {
 	buf := stream.NewFlowControlBuffer(stream.FlowControlParams{
 		InMemorySize: 0,
 		Limit:        10,
-	}, observabilitytest.NewTestLogger(t))
+	}, observabilitytest.NewTestLogger(t), runhandle.New())
 
 	buf.Add(newSavedWork("saved 1", 1, 10))
 	buf.Add(newSavedWork("saved 5", 5, 50))
@@ -96,7 +98,7 @@ func TestBackedUp_Offloads(t *testing.T) {
 	buf := stream.NewFlowControlBuffer(stream.FlowControlParams{
 		InMemorySize: 2,
 		Limit:        10,
-	}, observabilitytest.NewTestLogger(t))
+	}, observabilitytest.NewTestLogger(t), runhandle.New())
 
 	buf.Add(newSavedWork("saved 1", 1, 10)) // In-memory.
 	buf.Add(newSavedWork("saved 2", 2, 20)) // In-memory.
@@ -115,7 +117,7 @@ func TestBackedUp_AfterCleared_StoresInMemory(t *testing.T) {
 	buf := stream.NewFlowControlBuffer(stream.FlowControlParams{
 		InMemorySize: 2,
 		Limit:        10,
-	}, observabilitytest.NewTestLogger(t))
+	}, observabilitytest.NewTestLogger(t), runhandle.New())
 	buf.Add(newSavedWork("saved 1", 1, 10)) // In-memory.
 	buf.Add(newSavedWork("saved 2", 2, 20)) // In-memory.
 	buf.Add(newSavedWork("saved 3", 3, 20)) // Offloaded, now we're backed up.

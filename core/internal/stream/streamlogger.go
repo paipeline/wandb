@@ -6,9 +6,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/getsentry/sentry-go"
 	"github.com/google/wire"
+
 	"github.com/wandb/wandb/core/internal/observability"
-	"github.com/wandb/wandb/core/internal/sentry_ext"
 	"github.com/wandb/wandb/core/internal/settings"
 	"github.com/wandb/wandb/core/internal/version"
 )
@@ -19,19 +20,20 @@ type streamLoggerFile *os.File
 // streamLoggerProviders provides stream logging-related bindings.
 var streamLoggerProviders = wire.NewSet(
 	openStreamLoggerFile,
+	streamSentryContext,
 	streamLogger,
 )
 
 // symlinkDebugCore symlinks the debug-core.log file to the run's directory.
 func symlinkDebugCore(
-	settings *settings.Settings,
+	s *settings.Settings,
 	loggerPath string,
 ) {
 	if loggerPath == "" {
 		return
 	}
 
-	targetPath := filepath.Join(settings.GetLogDir(), "debug-core.log")
+	targetPath := filepath.Join(s.GetLogDir(), "debug-core.log")
 
 	err := os.Symlink(loggerPath, targetPath)
 	if err != nil {
@@ -43,24 +45,45 @@ func symlinkDebugCore(
 	}
 }
 
+// streamSentryContext returns the Sentry context for the stream.
+//
+// Returns nil if the run is offline.
+func streamSentryContext(s *settings.Settings) *observability.SentryContext {
+	if s.IsOffline() {
+		return nil
+	}
+
+	sentryCtx := observability.NewSentryContext(sentry.CurrentHub())
+	sentryCtx.SetUser(sentry.User{
+		ID:    s.GetEntity(),
+		Email: s.GetEmail(),
+		Name:  s.GetUserName(),
+	})
+	return sentryCtx
+}
+
 // streamLogger initializes a logger for the run.
 func streamLogger(
 	loggerFile streamLoggerFile,
-	settings *settings.Settings,
-	sentryClient *sentry_ext.Client,
+	sentryCtx *observability.SentryContext,
+	s *settings.Settings,
 	logLevel slog.Level,
 ) *observability.CoreLogger {
-	sentryClient.SetUser(
-		settings.GetEntity(),
-		settings.GetEmail(),
-		settings.GetUserName(),
-	)
-
 	var writer io.Writer
 	if loggerFile != nil {
 		writer = (*os.File)(loggerFile)
 	} else {
 		writer = io.Discard
+	}
+
+	sentryOnlyTags := observability.Tags{
+		"run_id":   s.GetRunID(),
+		"run_url":  s.GetRunURL(),
+		"project":  s.GetProject(),
+		"base_url": s.GetBaseURL(),
+	}
+	if s.GetSweepURL() != "" {
+		sentryOnlyTags["sweep_url"] = s.GetSweepURL()
 	}
 
 	logger := observability.NewCoreLogger(
@@ -71,27 +94,11 @@ func streamLogger(
 				// AddSource: true,
 			},
 		)),
-		&observability.CoreLoggerParams{
-			Tags:   observability.Tags{},
-			Sentry: sentryClient,
-		},
-	)
+		sentryCtx,
+	).With(nil, sentryOnlyTags)
 
-	logger.Info(
-		"stream: starting",
-		"core version", version.Version)
-
-	tags := observability.Tags{
-		"run_id":   settings.GetRunID(),
-		"run_url":  settings.GetRunURL(),
-		"project":  settings.GetProject(),
-		"base_url": settings.GetBaseURL(),
-	}
-	if settings.GetSweepURL() != "" {
-		tags["sweep_url"] = settings.GetSweepURL()
-	}
-	logger.SetGlobalTags(tags)
-
+	logger.CaptureInfo("wandb-core")
+	logger.Info("stream: starting", "core version", version.Version)
 	return logger
 }
 
@@ -99,12 +106,12 @@ func streamLogger(
 //
 // On failure, this will log to the global log file (debug-core.log)
 // and return nil.
-func openStreamLoggerFile(settings *settings.Settings) streamLoggerFile {
-	path := settings.GetInternalLogFile()
+func openStreamLoggerFile(s *settings.Settings) streamLoggerFile {
+	path := s.GetInternalLogFile()
 	loggerFile, err := os.OpenFile(
 		path,
 		os.O_APPEND|os.O_CREATE|os.O_WRONLY,
-		0666,
+		0o666,
 	)
 
 	if err != nil {

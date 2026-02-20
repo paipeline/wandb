@@ -12,37 +12,44 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wandb/wandb/core/internal/httplayers"
 	"github.com/wandb/wandb/core/internal/settings"
 )
 
 // CredentialProvider adds credentials to HTTP requests.
-type CredentialProvider interface {
-	// Apply sets the appropriate authorization headers or parameters on the
-	// HTTP request.
-	Apply(req *http.Request) error
-}
+type CredentialProvider httplayers.HTTPWrapper
 
 // NewCredentialProvider creates a new credential provider based on the SDK
 // settings. Settings for JWT authentication are prioritized above API key
 // authentication.
 func NewCredentialProvider(
-	settings *settings.Settings,
+	s *settings.Settings,
 	logger *slog.Logger,
 ) (CredentialProvider, error) {
-	if settings.GetIdentityTokenFile() != "" {
+	if s.GetIdentityTokenFile() != "" {
 		return NewOAuth2CredentialProvider(
-			settings.GetBaseURL(),
-			settings.GetIdentityTokenFile(),
-			settings.GetCredentialsFile(),
+			s.GetBaseURL(),
+			s.GetIdentityTokenFile(),
+			s.GetCredentialsFile(),
 			logger,
 		)
 	}
 
-	if apiKey := settings.GetAPIKey(); apiKey != "" {
+	if apiKey := s.GetAPIKey(); apiKey != "" {
 		return &apiKeyCredentialProvider{apiKey: apiKey}, nil
 	}
 
 	return NoopCredentialProvider{}, nil
+}
+
+// NewAPIKeyCredentialProvider returns a credential provider that uses the given
+// API key.
+//
+// This passes the API key in the Authorization header of the request using
+// HTTP Basic Authentication. The API key is used as the password,
+// while the username is left empty.
+func NewAPIKeyCredentialProvider(apiKey string) CredentialProvider {
+	return &apiKeyCredentialProvider{apiKey}
 }
 
 var _ CredentialProvider = &apiKeyCredentialProvider{}
@@ -52,10 +59,18 @@ type apiKeyCredentialProvider struct {
 	apiKey string
 }
 
-// Apply sets the API key in the Authorization header of the request using
-// HTTP Basic Authentication. The API key is used as the password,
-// while the username is left empty.
-func (c *apiKeyCredentialProvider) Apply(req *http.Request) error {
+// WrapHTTP implements HTTPWrapper.WrapHTTP.
+func (c *apiKeyCredentialProvider) WrapHTTP(
+	send httplayers.HTTPDoFunc,
+) httplayers.HTTPDoFunc {
+	return func(req *http.Request) (*http.Response, error) {
+		_ = c.apply(req)
+		return send(req)
+	}
+}
+
+// apply sets the Authorization header on the request.
+func (c *apiKeyCredentialProvider) apply(req *http.Request) error {
 	req.Header.Set(
 		"Authorization",
 		"Basic "+base64.StdEncoding.EncodeToString(
@@ -66,11 +81,12 @@ func (c *apiKeyCredentialProvider) Apply(req *http.Request) error {
 
 type NoopCredentialProvider struct{}
 
-func (c NoopCredentialProvider) Apply(req *http.Request) error {
-	return nil
+// WrapHTTP implements HTTPWrapper.WrapHTTP.
+func (c NoopCredentialProvider) WrapHTTP(
+	send httplayers.HTTPDoFunc,
+) httplayers.HTTPDoFunc {
+	return send
 }
-
-var _ CredentialProvider = &oauth2CredentialProvider{}
 
 // OAuth2CredentialProvider creates a credentials provider that exchanges a JWT
 // for an access token via an authorization server. The access token is then used
@@ -162,10 +178,23 @@ type CredentialsFile struct {
 	Credentials map[string]accessTokenInfo `json:"credentials"`
 }
 
-// Apply Checks if the access token is expiring, and fetches a new one if so.
-// It then supplies the access token to the request via the Authorization header
-// as a Bearer token.
-func (c *oauth2CredentialProvider) Apply(req *http.Request) error {
+// WrapHTTP implements HTTPWrapper.WrapHTTP.
+func (c *oauth2CredentialProvider) WrapHTTP(
+	send httplayers.HTTPDoFunc,
+) httplayers.HTTPDoFunc {
+	return func(req *http.Request) (*http.Response, error) {
+		err := c.apply(req)
+		if err != nil {
+			return nil, httplayers.URLError(req, err)
+		}
+
+		return send(req)
+	}
+}
+
+// apply fetches a new access token if necessary and supplies it to the request
+// via the Authorization header as a Bearer token.
+func (c *oauth2CredentialProvider) apply(req *http.Request) error {
 	if c.shouldRefreshToken() {
 		err := c.loadCredentials()
 		if err != nil {
@@ -257,7 +286,7 @@ func (c *oauth2CredentialProvider) trySaveCredentialsToFile(credentials Credenti
 		c.logger.Warn("failed to update credentials file", "error", err.Error())
 		return
 	}
-	err = os.WriteFile(c.credentialsFilePath, file, 0600)
+	err = os.WriteFile(c.credentialsFilePath, file, 0o600)
 	if err != nil {
 		c.logger.Warn("failed to write credentials file", "error", err.Error())
 	}

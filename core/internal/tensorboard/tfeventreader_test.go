@@ -11,12 +11,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/observabilitytest"
 	"github.com/wandb/wandb/core/internal/paths"
 	"github.com/wandb/wandb/core/internal/tensorboard"
 	"github.com/wandb/wandb/core/internal/tensorboard/tbproto"
-	"google.golang.org/protobuf/proto"
 )
 
 func encodeEvent(event *tbproto.TFEvent) []byte {
@@ -181,6 +182,7 @@ func runTest(
 		logger,
 		func() time.Time { return ctx.Now },
 	)
+	defer ctx.Reader.Close()
 
 	for _, step := range testSteps {
 		step.Do(t, ctx)
@@ -255,4 +257,64 @@ func TestGivesUpOnChecksumErrorAfterTimeout(t *testing.T) {
 		advanceTime(45*time.Second),
 		nextEventErr("unexpected payload checksum"),
 	)
+}
+
+func TestReadsLargeData(t *testing.T) {
+	if testing.Short() {
+		t.Skip()
+	}
+
+	tmpdir := t.TempDir()
+	tmpdirAsPath, err := tensorboard.ParseTBPath(tmpdir)
+	require.NoError(t, err)
+
+	// Create an event that's larger than the minimum read size (1 MiB).
+	inputData := slices.Repeat([]byte{1, 2, 3, 4}, 500_000)
+	eventBytes := encodeEvent(&tbproto.TFEvent{
+		What: &tbproto.TFEvent_Summary{
+			Summary: &tbproto.Summary{
+				Value: []*tbproto.Summary_Value{{
+					Tag: "x",
+					Value: &tbproto.Summary_Value_Tensor{
+						Tensor: &tbproto.TensorProto{
+							TensorContent: inputData,
+						},
+					},
+				}},
+			},
+		},
+	})
+	require.Greater(t, len(eventBytes), 2_000_000)
+
+	// Write to file.
+	file, err := os.Create(filepath.Join(tmpdir, "tfevents.1.host"))
+	require.NoError(t, err)
+	defer file.Close()
+	require.NoError(t,
+		os.WriteFile(
+			filepath.Join(tmpdir, "tfevents.1.host"),
+			eventBytes,
+			0o644))
+	require.NoError(t, file.Close())
+
+	// Read it back.
+	reader := tensorboard.NewTFEventReader(
+		tmpdirAsPath,
+		tensorboard.TFEventsFileFilter{},
+		observabilitytest.NewTestLogger(t),
+		func() time.Time { return time.Time{} },
+	)
+	defer reader.Close()
+	event, _ := reader.NextEvent(
+		t.Context(),
+		func(locp *tensorboard.LocalOrCloudPath) {},
+	)
+
+	require.NotNil(t, event)
+	data := event.
+		What.(*tbproto.TFEvent_Summary).
+		Summary.Value[0].
+		Value.(*tbproto.Summary_Value_Tensor).
+		Tensor.TensorContent
+	require.Len(t, data, len(inputData))
 }

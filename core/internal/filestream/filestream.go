@@ -2,6 +2,7 @@
 package filestream
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"sync"
@@ -9,12 +10,13 @@ import (
 	"time"
 
 	"github.com/google/wire"
+	"golang.org/x/time/rate"
+
 	"github.com/wandb/wandb/core/internal/api"
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/settings"
 	"github.com/wandb/wandb/core/internal/waiting"
 	"github.com/wandb/wandb/core/internal/wboperation"
-	"golang.org/x/time/rate"
 )
 
 const (
@@ -95,8 +97,9 @@ type fileStream struct {
 	// This must not include the schema and hostname prefix.
 	path string
 
-	mu         sync.Mutex
-	isFinished bool
+	mu              sync.Mutex
+	isFinished      bool
+	beforeRunEndCtx context.Context
 
 	processChan  chan Update
 	feedbackWait *sync.WaitGroup
@@ -114,7 +117,7 @@ type fileStream struct {
 	printer *observability.Printer
 
 	// The client for making API requests.
-	apiClient api.Client
+	apiClient api.RetryableClient
 	baseURL   *url.URL
 
 	// The rate limit for sending data to the backend.
@@ -149,7 +152,8 @@ type FileStreamFactory struct {
 
 // New returns a new FileStream.
 func (f *FileStreamFactory) New(
-	apiClient api.Client,
+	apiClient api.RetryableClient,
+	beforeRunEndCtx context.Context,
 	heartbeatStopwatch waiting.Stopwatch,
 	transmitRateLimit *rate.Limiter,
 ) FileStream {
@@ -162,16 +166,17 @@ func (f *FileStreamFactory) New(
 	}
 
 	fs := &fileStream{
-		settings:     f.Settings,
-		logger:       f.Logger,
-		operations:   f.Operations,
-		printer:      f.Printer,
-		apiClient:    apiClient,
-		baseURL:      f.BaseURL,
-		processChan:  make(chan Update, BufferSize),
-		feedbackWait: &sync.WaitGroup{},
-		deadChanOnce: &sync.Once{},
-		deadChan:     make(chan struct{}),
+		beforeRunEndCtx: beforeRunEndCtx,
+		settings:        f.Settings,
+		logger:          f.Logger,
+		operations:      f.Operations,
+		printer:         f.Printer,
+		apiClient:       apiClient,
+		baseURL:         f.BaseURL,
+		processChan:     make(chan Update, BufferSize),
+		feedbackWait:    &sync.WaitGroup{},
+		deadChanOnce:    &sync.Once{},
+		deadChan:        make(chan struct{}),
 	}
 
 	fs.heartbeatStopwatch = heartbeatStopwatch
@@ -222,6 +227,8 @@ func (fs *fileStream) StreamUpdate(update Update) {
 	case fs.processChan <- update:
 	case <-fs.deadChan:
 		// Ignore everything if the filestream is dead.
+	case <-fs.beforeRunEndCtx.Done():
+		// Ignore new requests if the run got aborted.
 	}
 }
 

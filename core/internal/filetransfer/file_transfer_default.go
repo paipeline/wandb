@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/hashicorp/go-retryablehttp"
+
+	"github.com/wandb/wandb/core/internal/api"
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/wboperation"
 )
@@ -17,31 +19,25 @@ import (
 // DefaultFileTransfer uploads or downloads files to/from the server
 type DefaultFileTransfer struct {
 	// client is the HTTP client for the file transfer
-	client *retryablehttp.Client
+	client api.RetryableClient
 
 	// logger is the logger for the file transfer
 	logger *observability.CoreLogger
 
 	// fileTransferStats is used to track upload/download progress
 	fileTransferStats FileTransferStats
-
-	// extraHeaders attached to presigned urls, using same set of
-	// headers from graphql requests.
-	extraHeaders map[string]string
 }
 
 // NewDefaultFileTransfer creates a new fileTransfer
 func NewDefaultFileTransfer(
-	client *retryablehttp.Client,
+	client api.RetryableClient,
 	logger *observability.CoreLogger,
 	fileTransferStats FileTransferStats,
-	extraHeaders map[string]string,
 ) *DefaultFileTransfer {
 	fileTransfer := &DefaultFileTransfer{
 		logger:            logger,
 		client:            client,
 		fileTransferStats: fileTransferStats,
-		extraHeaders:      extraHeaders,
 	}
 	return fileTransfer
 }
@@ -76,7 +72,7 @@ func (ft *DefaultFileTransfer) Upload(task *DefaultUploadTask) error {
 		return err
 	}
 
-	req, err := ft.newRequest(http.MethodPut, task.Url, requestBody)
+	req, err := retryablehttp.NewRequest(http.MethodPut, task.Url, requestBody)
 	if err != nil {
 		return err
 	}
@@ -144,8 +140,7 @@ func (ft *DefaultFileTransfer) Download(task *DefaultDownloadTask) error {
 		return err
 	}
 
-	// TODO: redo it to use the progress writer, to track the download progress
-	req, err := ft.newRequest(http.MethodGet, task.Url, nil)
+	req, err := retryablehttp.NewRequest(http.MethodGet, task.Url, nil)
 	if err != nil {
 		return err
 	}
@@ -181,26 +176,36 @@ func (ft *DefaultFileTransfer) Download(task *DefaultDownloadTask) error {
 		}
 	}(resp.Body)
 
-	_, err = io.Copy(file, resp.Body)
+	progress, err := wboperation.Get(task.Context).NewProgress()
+	if err != nil {
+		ft.logger.CaptureError(fmt.Errorf("file transfer: download: %v", err))
+	}
+
+	// If Size is not set, try to get it from Content-Length header
+	size := task.Size
+	if size == 0 && resp.ContentLength > 0 {
+		size = resp.ContentLength
+	}
+
+	progressWriter := NewProgressWriter(
+		file,
+		func(processed int64) {
+			if task.ProgressCallback != nil {
+				task.ProgressCallback(int(processed), int(size))
+			}
+
+			if size == 0 {
+				progress.SetBytesDone(int(processed))
+			} else {
+				progress.SetBytesOfTotal(int(processed), int(size))
+			}
+		},
+	)
+	_, err = io.Copy(progressWriter, resp.Body)
 	if err != nil {
 		return err
 	}
 	return nil
-}
-
-func (ft *DefaultFileTransfer) newRequest(
-	method string,
-	url string,
-	body io.Reader,
-) (*retryablehttp.Request, error) {
-	req, err := retryablehttp.NewRequest(method, url, body)
-	if err != nil {
-		return nil, err
-	}
-	for k, v := range ft.extraHeaders {
-		req.Header.Set(k, v)
-	}
-	return req, nil
 }
 
 func getUploadRequestBody(
@@ -275,58 +280,4 @@ func getUploadRequestBody(
 		)
 	}
 	return requestBody, nil
-}
-
-type ProgressReader struct {
-	reader   io.ReadSeeker
-	len      int64
-	read     int64
-	callback func(processed, total int64)
-}
-
-func NewProgressReader(
-	reader io.ReadSeeker,
-	size int64,
-	callback func(processed, total int64),
-) *ProgressReader {
-	return &ProgressReader{
-		reader:   reader,
-		len:      size,
-		callback: callback,
-	}
-}
-
-// Seek implements io.Seeker.
-func (pr *ProgressReader) Seek(offset int64, whence int) (n int64, err error) {
-	n, err = pr.reader.Seek(offset, whence)
-
-	if err == nil {
-		pr.read = n
-		pr.invokeCallback()
-	}
-
-	return
-}
-
-// Read implements io.Reader.
-func (pr *ProgressReader) Read(p []byte) (n int, err error) {
-	n, err = pr.reader.Read(p)
-
-	if err == nil {
-		pr.read += int64(n)
-		pr.invokeCallback()
-	}
-
-	return
-}
-
-// Len implements retryablehttp.LenReader.
-func (pr *ProgressReader) Len() int {
-	return int(pr.len)
-}
-
-func (pr *ProgressReader) invokeCallback() {
-	if pr.callback != nil {
-		pr.callback(pr.read, pr.len)
-	}
 }

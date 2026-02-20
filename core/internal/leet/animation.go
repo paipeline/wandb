@@ -1,27 +1,33 @@
 package leet
 
-import "time"
+import (
+	"sync"
+	"time"
+)
 
-// AnimationState manages a sidebar's animated width.
-type AnimationState struct {
-	// currentWidth is the current rendered width (px/cols).
-	currentWidth int
+// AnimatedValue manages a scalar (width, height, etc.) that animates
+// smoothly between a collapsed state (0) and an expanded state.
+type AnimatedValue struct {
+	mu sync.RWMutex
 
-	// targetWidth is the desired width we're animating toward.
-	targetWidth int
+	// current is the current rendered size (px/cols/rows).
+	current int
 
-	// expandedWidth is the desired width when expanded.
-	expandedWidth int
+	// target is the desired size we're animating toward.
+	target int
 
-	// animationStartTime indicates when the current animation started.
-	animationStartTime time.Time
+	// expanded is the fully-expanded size.
+	expanded int
+
+	// startTime indicates when the current animation started.
+	startTime time.Time
 }
 
-func NewAnimationState(expanded bool, expandedWidth int) *AnimationState {
-	a := &AnimationState{expandedWidth: expandedWidth}
-	if expanded {
-		a.currentWidth = expandedWidth
-		a.targetWidth = expandedWidth
+func NewAnimatedValue(isExpanded bool, expandedSize int) *AnimatedValue {
+	a := &AnimatedValue{expanded: expandedSize}
+	if isExpanded {
+		a.current = expandedSize
+		a.target = expandedSize
 	}
 	return a
 }
@@ -29,77 +35,112 @@ func NewAnimationState(expanded bool, expandedWidth int) *AnimationState {
 // Toggle toggles between expanded and collapsed targets.
 //
 // No-op while animating to match current model gating semantics.
-func (a *AnimationState) Toggle() {
-	a.animationStartTime = time.Now()
+func (a *AnimatedValue) Toggle() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	if a.targetWidth == 0 {
-		a.targetWidth = a.expandedWidth
+	a.startTime = time.Now()
 
+	if a.target == 0 {
+		a.target = a.expanded
 	} else {
-		a.targetWidth = 0
+		a.target = 0
 	}
 }
 
 // Update advances the animation given a wall-clock time and returns
 // whether the animation is complete.
-func (a *AnimationState) Update(now time.Time) bool {
-	if !a.IsAnimating() {
+func (a *AnimatedValue) Update(now time.Time) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.current == a.target {
 		return true
 	}
-	elapsed := now.Sub(a.animationStartTime)
+	elapsed := now.Sub(a.startTime)
 	progress := float64(elapsed) / float64(AnimationDuration)
 	if progress >= 1 {
-		a.currentWidth = a.targetWidth
-		a.animationStartTime = time.Time{}
+		a.current = a.target
+		a.startTime = time.Time{}
 		return true
 	}
 
-	if a.IsExpanding() {
-		a.currentWidth = int(easeOutCubic(progress) * float64(a.expandedWidth))
+	if a.current < a.target {
+		a.current = int(easeOutCubic(progress) * float64(a.expanded))
 	} else {
-		a.currentWidth = int((1 - easeOutCubic(progress)) * float64(a.expandedWidth))
+		a.current = int((1 - easeOutCubic(progress)) * float64(a.expanded))
 	}
 
 	return false
 }
 
-// SetExpandedWidth updates the desired expanded width.
-func (a *AnimationState) SetExpandedWidth(width int) {
-	// Capture state before mutating fields so IsExpanded() is meaningful.
-	wasExpanded := a.IsExpanded()
+// SetExpanded updates the desired expanded size.
+func (a *AnimatedValue) SetExpanded(size int) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
 
-	a.expandedWidth = width
-	if a.targetWidth > 0 {
-		a.targetWidth = width
+	wasExpanded := a.target > 0 && a.current == a.target
+
+	a.expanded = size
+	if a.target > 0 {
+		a.target = size
 	}
 	if wasExpanded {
-		// We were stably expanded; snap immediately to the new width.
-		a.currentWidth = width
+		// We were stably expanded; snap immediately to the new size.
+		a.current = size
 	}
 }
 
-// Width returns the current width.
-func (a *AnimationState) Width() int { return a.currentWidth }
-
-// IsAnimating reports whether currentWidth != targetWidth.
-func (a *AnimationState) IsAnimating() bool { return a.currentWidth != a.targetWidth }
-
-// IsVisible returns true if any width is visible on screen.
-func (a *AnimationState) IsVisible() bool { return a.currentWidth > 0 }
-
-// IsExpanded returns true if we're stably at expanded width.
-func (a *AnimationState) IsExpanded() bool { return a.targetWidth > 0 && !a.IsAnimating() }
-
-// IsCollapsed returns true if we're stably collapsed.
-func (a *AnimationState) IsCollapsed() bool {
-	return a.targetWidth == 0 && a.currentWidth == 0 && !a.IsAnimating()
+// Value returns the current animated value.
+func (a *AnimatedValue) Value() int {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.current
 }
 
-// IsExpanding/IsCollapsing are derived from the direction to the target.
-func (a *AnimationState) IsExpanding() bool  { return a.currentWidth < a.targetWidth }
-func (a *AnimationState) IsCollapsing() bool { return a.currentWidth > a.targetWidth }
+// IsAnimating reports whether the value is in motion.
+func (a *AnimatedValue) IsAnimating() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.current != a.target
+}
 
-// easeOutCubic maps t c [0, 1] -> [0, 1] with deceleration near the end.
+// IsVisible returns true if the value is greater than zero.
+func (a *AnimatedValue) IsVisible() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.current > 0
+}
+
+// IsExpanded returns true if we're stably at the expanded value.
+func (a *AnimatedValue) IsExpanded() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.target > 0 && (a.current == a.target)
+}
+
+// IsCollapsed returns true if we're stably at zero.
+func (a *AnimatedValue) IsCollapsed() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.target == 0 && a.current == 0
+}
+
+// IsExpanding reports whether we're animating toward the expanded value.
+func (a *AnimatedValue) IsExpanding() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.current < a.target
+}
+
+// IsCollapsing reports whether we're animating toward zero.
+func (a *AnimatedValue) IsCollapsing() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.current > a.target
+}
+
+// easeOutCubic maps t ∈ [0, 1] -> [0, 1] with deceleration near the end.
 //
 // Values outside [0,1] are acceptable; callers clamp at 1.
 func easeOutCubic(t float64) float64 {

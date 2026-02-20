@@ -8,21 +8,25 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/url"
 	"sync"
 	"sync/atomic"
 
+	"github.com/Khan/genqlient/graphql"
+
+	"github.com/wandb/wandb/core/internal/api"
+	"github.com/wandb/wandb/core/internal/clients"
 	"github.com/wandb/wandb/core/internal/gql"
 	"github.com/wandb/wandb/core/internal/monitor"
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/runsync"
-	"github.com/wandb/wandb/core/internal/sentry_ext"
 	"github.com/wandb/wandb/core/internal/settings"
 	"github.com/wandb/wandb/core/internal/stream"
 	"github.com/wandb/wandb/core/internal/wbapi"
 
-	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
 	"google.golang.org/protobuf/proto"
-	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
 )
 
 const (
@@ -37,11 +41,10 @@ type ConnectionParams struct {
 
 	ID string
 
-	Conn         net.Conn
-	SentryClient *sentry_ext.Client
-	Commit       string
-	LoggerPath   string
-	LogLevel     slog.Level
+	Conn       net.Conn
+	Commit     string
+	LoggerPath string
+	LogLevel   slog.Level
 }
 
 // Connection represents a client-server connection in the context of a streaming session.
@@ -53,6 +56,9 @@ type ConnectionParams struct {
 type Connection struct {
 	// connLifetimeCtx is cancelled when the connection should be closed.
 	connLifetimeCtx context.Context
+
+	// requestCanceller manages cancellable requests.
+	requestCanceller *RequestCanceller
 
 	// stopServer signals the server to shut down, which also closes all
 	// connections.
@@ -88,9 +94,6 @@ type Connection struct {
 	// The current W&B Git commit hash, identifying the specific version of the binary.
 	commit string
 
-	// sentryClient is the sentry client
-	sentryClient *sentry_ext.Client
-
 	// loggerPath is the path to the logger
 	loggerPath string
 
@@ -108,6 +111,7 @@ func NewConnection(
 ) *Connection {
 	return &Connection{
 		connLifetimeCtx:    serverLifetimeCtx,
+		requestCanceller:   NewRequestCanceller(),
 		stopServer:         stopServer,
 		streamMux:          params.StreamMux,
 		runSyncManager:     params.RunSyncManager,
@@ -118,7 +122,6 @@ func NewConnection(
 		inChan:             make(chan *spb.ServerRequest, BufferSize),
 		outChan:            make(chan *spb.ServerResponse, BufferSize),
 		closed:             &atomic.Bool{},
-		sentryClient:       params.SentryClient,
 		loggerPath:         params.LoggerPath,
 		logLevel:           params.LogLevel,
 	}
@@ -311,8 +314,10 @@ func (nc *Connection) handleIncomingRequests() {
 		slog.Debug("handleIncomingRequests: processing message", "msg", msg, "id", nc.id)
 
 		switch x := msg.ServerRequestType.(type) {
+		case *spb.ServerRequest_Cancel:
+			nc.handleCancel(x.Cancel)
 		case *spb.ServerRequest_Authenticate:
-			nc.handleAuthenticate(x.Authenticate)
+			nc.handleAuthenticate(msg.RequestId, x.Authenticate)
 		case *spb.ServerRequest_InformInit:
 			nc.handleInformInit(x.InformInit)
 		case *spb.ServerRequest_InformAttach:
@@ -355,39 +360,35 @@ func (nc *Connection) handleIncomingRequests() {
 	slog.Debug("handleIncomingRequests: finished", "id", nc.id)
 }
 
+// handleCancel cancels the work of a previous server request.
+func (nc *Connection) handleCancel(msg *spb.ServerCancelRequest) {
+	slog.Info("connection: cancelling request",
+		"id", nc.id,
+		"requestId", msg.RequestId)
+	nc.requestCanceller.Cancel(msg.RequestId)
+}
+
 // handleInformInit handles the initialization of a new stream by the client.
 //
 // This function is invoked when the server receives an `InformInit` message
 // from the client. It creates a new stream, associates it with the connection.
 // Also starts the stream and adds the connection as a responder to the stream.
 func (nc *Connection) handleInformInit(msg *spb.ServerInformInitRequest) {
-	settings := settings.From(msg.GetSettings())
+	s := settings.From(msg.GetSettings())
 
 	streamId := msg.GetXInfo().GetStreamId()
 	slog.Info("handleInformInit: received", "streamId", streamId, "id", nc.id)
-
-	// if we are in offline mode, we don't want to send any data to sentry
-	var sentryClient *sentry_ext.Client
-	if settings.IsOffline() {
-		sentryClient = sentry_ext.New(sentry_ext.Params{Disabled: true})
-	} else {
-		sentryClient = nc.sentryClient
-	}
 
 	strm := stream.InjectStream(
 		stream.GitCommitHash(nc.commit),
 		nc.gpuResourceManager,
 		stream.DebugCorePath(nc.loggerPath),
 		nc.logLevel,
-		nc.sentryClient,
-		settings,
+		s,
 	)
 	strm.AddResponders(stream.ResponderEntry{Responder: nc, ID: nc.id})
 	strm.Start()
 	slog.Info("handleInformInit: stream started", "streamId", streamId, "id", nc.id)
-
-	// TODO: remove this once we have a better observability setup
-	sentryClient.CaptureMessage("wandb-core", nil)
 
 	if err := nc.streamMux.AddStream(streamId, strm); err != nil {
 		slog.Error(
@@ -447,39 +448,67 @@ func (nc *Connection) handleInformAttach(
 //
 // Note: This function will be deprecated once the Public API workflow
 // in wandb-core is implemented.
-func (nc *Connection) handleAuthenticate(msg *spb.ServerAuthenticateRequest) {
+func (nc *Connection) handleAuthenticate(
+	id string,
+	msg *spb.ServerAuthenticateRequest,
+) {
 	slog.Debug("handleAuthenticate: received", "id", nc.id)
 
-	s := settings.From(&spb.Settings{
-		ApiKey:  &wrapperspb.StringValue{Value: msg.ApiKey},
-		BaseUrl: &wrapperspb.StringValue{Value: msg.BaseUrl},
-	})
-	logger := observability.NewNoOpLogger() // TODO: use a real logger
-	baseURL := stream.BaseURLFromSettings(logger, s)
-	backend := stream.NewBackend(baseURL, logger, s)
-	graphqlClient := stream.NewGraphQLClient(backend, s, &observability.Peeker{}, "" /*clientId*/)
+	ctx, cancel := nc.requestCanceller.Context(id)
+	defer cancel()
 
-	data, err := gql.Viewer(context.Background(), graphqlClient)
-	if err != nil || data == nil || data.GetViewer() == nil || data.GetViewer().GetEntity() == nil {
-		nc.Respond(&spb.ServerResponse{
-			ServerResponseType: &spb.ServerResponse_AuthenticateResponse{
-				AuthenticateResponse: &spb.ServerAuthenticateResponse{
-					ErrorStatus: "Invalid credentials",
-					XInfo:       msg.XInfo,
-				},
-			},
-		})
-		return
-	}
+	response := nc.handleAuthenticateImpl(ctx, msg)
+	response.XInfo = msg.XInfo
 
 	nc.Respond(&spb.ServerResponse{
 		ServerResponseType: &spb.ServerResponse_AuthenticateResponse{
-			AuthenticateResponse: &spb.ServerAuthenticateResponse{
-				DefaultEntity: *data.GetViewer().GetEntity(),
-				XInfo:         msg.XInfo,
-			},
+			AuthenticateResponse: response,
 		},
 	})
+}
+
+func (nc *Connection) handleAuthenticateImpl(
+	ctx context.Context,
+	msg *spb.ServerAuthenticateRequest,
+) *spb.ServerAuthenticateResponse {
+	baseURL, err := url.Parse(msg.BaseUrl)
+	if err != nil {
+		return &spb.ServerAuthenticateResponse{
+			ErrorStatus: fmt.Sprintf("Invalid URL: %v", err),
+		}
+	}
+
+	logger := observability.NewNoOpLogger() // TODO: use a real logger
+	credentialProvider := api.NewAPIKeyCredentialProvider(msg.ApiKey)
+
+	apiClient := api.NewClient(api.ClientOptions{
+		BaseURL:     baseURL,
+		RetryPolicy: clients.CheckRetry,
+
+		RetryMax:        api.DefaultRetryMax,
+		RetryWaitMin:    api.DefaultRetryWaitMin,
+		RetryWaitMax:    api.DefaultRetryWaitMax,
+		NonRetryTimeout: api.DefaultNonRetryTimeout,
+
+		CredentialProvider: credentialProvider,
+		Logger:             logger.Logger,
+	})
+
+	graphqlClient := graphql.NewClient(
+		baseURL.JoinPath("graphql").String(),
+		api.AsStandardClient(apiClient),
+	)
+
+	data, err := gql.Viewer(ctx, graphqlClient)
+	if err != nil || data == nil || data.GetViewer() == nil || data.GetViewer().GetEntity() == nil {
+		return &spb.ServerAuthenticateResponse{
+			ErrorStatus: "Invalid credentials",
+		}
+	}
+
+	return &spb.ServerAuthenticateResponse{
+		DefaultEntity: *data.GetViewer().GetEntity(),
+	}
 }
 
 // handleInformRecord processes a regular record message from the client.
@@ -583,7 +612,10 @@ func (nc *Connection) handleSync(
 	go func() {
 		defer wg.Done()
 
-		response := nc.runSyncManager.DoSync(request)
+		ctx, cancel := nc.requestCanceller.Context(id)
+		defer cancel()
+
+		response := nc.runSyncManager.DoSync(ctx, request)
 		nc.Respond(&spb.ServerResponse{
 			RequestId: id,
 			ServerResponseType: &spb.ServerResponse_SyncResponse{
@@ -608,8 +640,8 @@ func (nc *Connection) handleSyncStatus(
 }
 
 func (nc *Connection) handleApiInit(id string, request *spb.ServerApiInitRequest) {
-	settings := settings.From(request.GetSettings())
-	nc.wbapi = wbapi.NewWandbAPI(settings, nc.sentryClient)
+	s := settings.From(request.GetSettings())
+	nc.wbapi = wbapi.NewWandbAPI(s)
 	nc.Respond(&spb.ServerResponse{
 		RequestId: id,
 		ServerResponseType: &spb.ServerResponse_ApiInitResponse{
@@ -672,7 +704,6 @@ func (nc *Connection) Close() {
 // The response is then processed and sent to the client by the `processOutgoingData`
 // function.
 func (nc *Connection) Respond(resp *spb.ServerResponse) {
-
 	// Check if the connection has already been closed
 	if nc.closed.Load() {
 		// TODO: this is a bit of a hack, we should probably handle this better

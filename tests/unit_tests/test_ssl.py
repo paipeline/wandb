@@ -3,8 +3,9 @@ import dataclasses
 import http.server
 import ssl
 import threading
+from collections.abc import Iterator, Mapping
 from pathlib import Path
-from typing import Callable, Iterator, Mapping
+from typing import Callable
 from unittest.mock import patch
 
 import pytest
@@ -39,7 +40,7 @@ def ssl_server(ssl_creds: SSLCredPaths) -> Iterator[http.server.HTTPServer]:
     class MyServer(http.server.BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
-        def do_GET(self):  # noqa: N802
+        def do_GET(self):
             body = b"Hello, world!"
             self.send_response(200)
             self.send_header("Content-Type", "text/plain; charset=utf-8")

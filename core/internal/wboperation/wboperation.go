@@ -227,7 +227,7 @@ func (op *WandbOperation) MarkRetryingHTTPError(
 	op.mu.Lock()
 	defer op.mu.Unlock()
 
-	if len(responseError) > 0 {
+	if responseError != "" {
 		op.errorStatus = fmt.Sprintf(
 			"retrying HTTP %d: %s",
 			responseStatusCode,
@@ -337,6 +337,17 @@ func (op *WandbOperation) Finish() {
 // WandbProgress is a handle for setting the progress on an operation.
 type WandbProgress struct {
 	op *WandbOperation
+}
+
+func (p *WandbProgress) SetBytesDone(doneBytes int) {
+	if p == nil {
+		return
+	}
+
+	p.op.mu.Lock()
+	defer p.op.mu.Unlock()
+
+	p.op.progress = bytesToShortString(doneBytes)
 }
 
 func (p *WandbProgress) SetBytesOfTotal(doneBytes, totalBytes int) {

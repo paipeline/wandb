@@ -6,6 +6,9 @@ import (
 
 	"github.com/Khan/genqlient/graphql"
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
 	"github.com/wandb/wandb/core/internal/featurechecker"
 	"github.com/wandb/wandb/core/internal/filestream"
 	"github.com/wandb/wandb/core/internal/filetransfer"
@@ -21,8 +24,6 @@ import (
 	"github.com/wandb/wandb/core/internal/watchertest"
 	"github.com/wandb/wandb/core/pkg/artifacts"
 	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
-	"go.uber.org/mock/gomock"
-	"google.golang.org/protobuf/types/known/wrapperspb"
 )
 
 const validLinkArtifactResponse = `{
@@ -46,13 +47,14 @@ func makeSender(t *testing.T, client graphql.Client) testFixtures {
 		ApiKey:  &wrapperspb.StringValue{Value: "test-api-key"},
 	})
 	baseURL := stream.BaseURLFromSettings(logger, settings)
-	backend := stream.NewBackend(baseURL, logger, settings)
+	credentialProvider := stream.CredentialsFromSettings(logger, settings)
 	fileStreamFactory := &filestream.FileStreamFactory{
 		Logger:   logger,
 		Printer:  observability.NewPrinter(),
 		Settings: settings,
 	}
 	fileTransferManager := stream.NewFileTransferManager(
+		baseURL,
 		filetransfer.NewFileTransferStats(),
 		logger,
 		settings,
@@ -67,9 +69,10 @@ func makeSender(t *testing.T, client graphql.Client) testFixtures {
 	runHandle := runhandle.New()
 
 	senderFactory := stream.SenderFactory{
+		BaseURL:                 baseURL,
+		CredentialProvider:      credentialProvider,
 		Logger:                  logger,
 		Settings:                settings,
-		Backend:                 backend,
 		FileStreamFactory:       fileStreamFactory,
 		FileTransferManager:     fileTransferManager,
 		RunfilesUploaderFactory: runfilesUploaderFactory,

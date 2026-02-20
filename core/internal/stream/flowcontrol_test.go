@@ -6,7 +6,10 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"go.uber.org/mock/gomock"
+
 	"github.com/wandb/wandb/core/internal/observabilitytest"
+	"github.com/wandb/wandb/core/internal/runhandle"
 	"github.com/wandb/wandb/core/internal/runwork"
 	"github.com/wandb/wandb/core/internal/runworktest"
 	"github.com/wandb/wandb/core/internal/settings"
@@ -15,7 +18,6 @@ import (
 	"github.com/wandb/wandb/core/internal/transactionlog"
 	"github.com/wandb/wandb/core/internal/transactionlogtest"
 	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
-	"go.uber.org/mock/gomock"
 )
 
 type fcTestFixtures struct {
@@ -44,7 +46,10 @@ func setup(
 	ctrl := gomock.NewController(t)
 	mockRecordParser := streamtest.NewMockRecordParser(ctrl)
 
-	flowControlFactory := &stream.FlowControlFactory{Logger: testLogger}
+	flowControlFactory := &stream.FlowControlFactory{
+		Logger:    testLogger,
+		RunHandle: runhandle.New(),
+	}
 	writerFactory := &stream.WriterFactory{
 		Logger:   testLogger,
 		Settings: settings.New(),

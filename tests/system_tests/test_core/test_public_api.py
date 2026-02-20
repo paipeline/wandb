@@ -1,7 +1,9 @@
 """Tests for the `wandb.apis.PublicApi` module."""
 
+from __future__ import annotations
+
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any
 from unittest import mock
 
 import pytest
@@ -76,8 +78,8 @@ def stub_run_gql_once(user, wandb_backend_spy):
 
     def helper(
         id: str = user,
-        config: Optional[Dict] = None,
-        summary_metrics: Optional[Dict] = None,
+        config: dict | None = None,
+        summary_metrics: dict | None = None,
         project_id: str = "123",
     ):
         body = {
@@ -129,7 +131,7 @@ def stub_run_full_history(wandb_backend_spy):
 
     gql = wandb_backend_spy.gql
 
-    def helper(history: Optional[List] = None, events: Optional[List] = None):
+    def helper(history: list | None = None, events: list | None = None):
         history = [json.dumps(h) for h in history or []]
         events = [json.dumps(e) for e in events or []]
         body = {
@@ -334,6 +336,54 @@ def test_run_delete(wandb_backend_spy):
     assert delete_spy.requests[1].variables["deleteArtifacts"]
 
 
+def test_run_update_state_success(wandb_backend_spy):
+    """Test successful state transition to pending."""
+    gql = wandb_backend_spy.gql
+    update_state_spy = gql.Capture()
+
+    wandb_backend_spy.stub_gql(
+        gql.Matcher(operation="UpdateRunState"),
+        gql.Constant(content={"data": {"updateRunState": {"success": True}}}),
+    )
+    wandb_backend_spy.stub_gql(
+        gql.Matcher(operation="UpdateRunState"),
+        update_state_spy,
+    )
+
+    seed_run = Api().create_run()
+    run = Api().run(f"{seed_run.entity}/{seed_run.project}/{seed_run.id}")
+    run._attrs["state"] = "failed"
+    run._state = "failed"
+
+    result = run.update_state("pending")
+
+    assert result is True
+    assert run.state == "pending"
+    assert update_state_spy.total_calls == 1
+    assert update_state_spy.requests[0].variables["input"]["state"] == "pending"
+    assert update_state_spy.requests[0].variables["input"]["id"] == run.storage_id
+
+
+def test_run_update_state_failure(wandb_backend_spy):
+    """Test that update_state returns False when server rejects transition."""
+    gql = wandb_backend_spy.gql
+
+    wandb_backend_spy.stub_gql(
+        gql.Matcher(operation="UpdateRunState"),
+        gql.Constant(content={"data": {"updateRunState": {"success": False}}}),
+    )
+
+    seed_run = Api().create_run()
+    run = Api().run(f"{seed_run.entity}/{seed_run.project}/{seed_run.id}")
+    run._attrs["state"] = "running"
+    run._state = "running"
+
+    result = run.update_state("pending")
+
+    assert result is False
+    assert run.state == "running"
+
+
 def test_run_file_direct(
     user,
     stub_run_gql_once,
@@ -480,6 +530,18 @@ def test_projects(user, wandb_backend_spy):
                             entity_name=user,
                             created_at="2021-01-01T00:00:00Z",
                             is_benchmark=False,
+                            user=UserFragment(
+                                id="123",
+                                name="test-user",
+                                username="test-user",
+                                email="test-user@example.com",
+                                admin=False,
+                                flags="",
+                                entity="test-entity",
+                                deleted_at=None,
+                                api_keys=None,
+                                teams=None,
+                            ),
                         ).model_dump(),
                     }
                     for i in range(num_projects)
@@ -517,6 +579,18 @@ def test_project_get_id(user, wandb_backend_spy):
                         "entityName": "test-entity",
                         "createdAt": "2021-01-01T00:00:00Z",
                         "isBenchmark": False,
+                        "user": {
+                            "id": "123",
+                            "name": "test-user",
+                            "username": "test-user",
+                            "email": "test-user@example.com",
+                            "admin": False,
+                            "flags": "",
+                            "entity": "test-entity",
+                            "deletedAt": None,
+                            "apiKeys": None,
+                            "teams": None,
+                        },
                     },
                 },
             }
@@ -540,6 +614,18 @@ def test_project_get_id_project_does_not_exist__raises_error(user, wandb_backend
                         "entityName": "test-entity",
                         "createdAt": "2021-01-01T00:00:00Z",
                         "isBenchmark": False,
+                        "user": {
+                            "id": "123",
+                            "name": "test-user",
+                            "username": "test-user",
+                            "email": "test-user@example.com",
+                            "admin": False,
+                            "flags": "",
+                            "entity": "test-entity",
+                            "deletedAt": None,
+                            "apiKeys": None,
+                            "teams": None,
+                        },
                     },
                 },
             }
@@ -549,6 +635,72 @@ def test_project_get_id_project_does_not_exist__raises_error(user, wandb_backend
     with pytest.raises(ValueError):
         project = Api().project(user, "test")
         project.id  # noqa: B018
+
+
+@pytest.mark.usefixtures("patch_apikey", "skip_verify_login")
+def test_project_get_owner(monkeypatch, wandb_backend_spy):
+    gql = wandb_backend_spy.gql
+    wandb_backend_spy.stub_gql(
+        gql.Matcher(operation="GetProject"),
+        gql.once(
+            content={
+                "data": {
+                    "project": {
+                        "id": "123",
+                        "name": "test-project",
+                        "entityName": "test-entity",
+                        "createdAt": "2021-01-01T00:00:00Z",
+                        "isBenchmark": False,
+                        "user": {
+                            "id": "123",
+                            "name": "test-user",
+                            "username": "test-user",
+                            "email": "test-user@example.com",
+                            "admin": False,
+                            "flags": "",
+                            "entity": "test-entity",
+                            "deletedAt": None,
+                            "apiKeys": None,
+                            "teams": None,
+                        },
+                    },
+                },
+            }
+        ),
+    )
+
+    api = wandb.Api()
+    project = api.project("test-entity", "test-project")
+
+    assert project.owner.id == "123"
+    assert project.owner.name == "test-user"
+
+
+@pytest.mark.usefixtures("patch_apikey", "skip_verify_login")
+def test_project_get_owner_does_not_exist_raises_error(monkeypatch, wandb_backend_spy):
+    gql = wandb_backend_spy.gql
+    wandb_backend_spy.stub_gql(
+        gql.Matcher(operation="GetProject"),
+        gql.once(
+            content={
+                "data": {
+                    "project": {
+                        "id": "123",
+                        "name": "test-project",
+                        "entityName": "test-entity",
+                        "createdAt": "2021-01-01T00:00:00Z",
+                        "isBenchmark": False,
+                    },
+                },
+            }
+        ),
+    )
+
+    api = wandb.Api()
+    project = api.project("test-entity", "test-project")
+
+    with pytest.raises(ValueError):
+        _ = project.owner
 
 
 def test_project_get_sweeps(user, wandb_backend_spy):
@@ -948,12 +1100,16 @@ def test_query_team(user, api):
     assert repr(t.members[0]) == f"<Member {user} (USER)>"
 
 
-def test_viewer(user, api):
+def test_viewer(user: str, api: wandb.Api):
     v = api.viewer
     assert v.admin is False
     assert v.username == user
-    assert v.api_keys == [user]
     assert v.teams == [user]
+
+    # api_keys returns IDs of API keys. In tests, the API key ID is a prefix
+    # of the API key, which is also the username.
+    assert len(v.api_keys) == 1
+    assert user.startswith(v.api_keys[0])
 
 
 def test_create_team_exists(wandb_backend_spy):
@@ -969,10 +1125,10 @@ def test_create_team_exists(wandb_backend_spy):
 
 def fake_search_users_response(
     email: str,
-    api_keys: Dict[str, str],
-    teams: List[str],
+    api_keys: dict[str, str],
+    teams: list[str],
     count: int = 1,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Returns a fake response to a SearchUsers GraphQL query."""
     return {
         "data": {
@@ -1006,8 +1162,8 @@ def stub_search_users(wandb_backend_spy):
 
     def helper(
         email: str,
-        api_keys: Dict[str, str],
-        teams: List[str],
+        api_keys: dict[str, str],
+        teams: list[str],
         count: int = 1,
     ):
         search_users_spy = gql.Constant(

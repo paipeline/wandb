@@ -10,8 +10,10 @@ import (
 	"testing"
 
 	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
 	"github.com/wandb/wandb/core/internal/gqlmock"
 	"github.com/wandb/wandb/core/internal/runhistoryreader/parquet/iterator"
 	"github.com/wandb/wandb/core/internal/runhistoryreader/parquet/iterator/iteratortest"
@@ -85,6 +87,8 @@ func mockGraphQLWithParquetUrls(urls []string) *gqlmock.MockClient {
 func TestHistoryReader_GetHistorySteps_WithoutKeys(t *testing.T) {
 	ctx := t.Context()
 	tempDir := t.TempDir()
+	t.Setenv("WANDB_CACHE_DIR", tempDir)
+
 	schema := arrow.NewSchema(
 		[]arrow.Field{
 			{Name: "_step", Type: arrow.PrimitiveTypes.Int64},
@@ -111,7 +115,7 @@ func TestHistoryReader_GetHistorySteps_WithoutKeys(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		true,
 	)
@@ -187,7 +191,7 @@ func TestHistoryReader_GetHistorySteps_MultipleFiles(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		true,
 	)
@@ -215,6 +219,8 @@ func TestHistoryReader_GetHistorySteps_MultipleFiles(t *testing.T) {
 func TestHistoryReader_GetHistorySteps_WithKeys(t *testing.T) {
 	ctx := t.Context()
 	tempDir := t.TempDir()
+	t.Setenv("WANDB_CACHE_DIR", tempDir)
+
 	schema := arrow.NewSchema(
 		[]arrow.Field{
 			{Name: "_step", Type: arrow.PrimitiveTypes.Int64},
@@ -242,7 +248,7 @@ func TestHistoryReader_GetHistorySteps_WithKeys(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{"metric1"},
 		true,
 	)
@@ -314,7 +320,7 @@ func TestHistoryReader_GetHistorySteps_AllLiveData(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		true,
 	)
@@ -379,7 +385,7 @@ func TestHistoryReader_GetHistorySteps_AllLiveData_WithKeys(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{"metric1"},
 		true,
 	)
@@ -462,7 +468,7 @@ func TestHistoryReader_GetHistorySteps_MixedParquetAndLiveData(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		true,
 	)
@@ -508,7 +514,7 @@ func TestHistoryReader_GetHistorySteps_NoPanicOnInvalidLiveData(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		false,
 	)
@@ -540,7 +546,7 @@ func TestHistoryReader_GetHistorySteps_NoPanicOnMissingStepKey(t *testing.T) {
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		false,
 	)
@@ -572,11 +578,11 @@ func TestHistoryReader_GetHistorySteps_NoPanicOnNonConvertibleStepValue(t *testi
 		"test-project",
 		"test-run-id",
 		mockGQL,
-		http.DefaultClient,
+		retryablehttp.NewClient(),
 		[]string{},
 		false,
 	)
-	assert.ErrorContains(t, err, "expected step value to be convertible to int")
+	assert.ErrorContains(t, err, "expected step to be float64")
 }
 
 func TestHistoryReader_GetHistorySteps_ConvertsStepValueToInt(t *testing.T) {
@@ -624,7 +630,7 @@ func TestHistoryReader_GetHistorySteps_ConvertsStepValueToInt(t *testing.T) {
 				"test-project",
 				"test-run-id",
 				mockGQL,
-				http.DefaultClient,
+				retryablehttp.NewClient(),
 				[]string{},
 				false,
 			)

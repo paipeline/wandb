@@ -2,13 +2,14 @@ package filestream
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
 	"sync"
+
+	"github.com/hashicorp/go-retryablehttp"
 
 	"github.com/wandb/wandb/core/internal/wboperation"
 )
@@ -137,8 +138,8 @@ func (fs *fileStream) send(
 	op := fs.trackUploadOperation(data)
 	defer op.Finish()
 
-	req, err := http.NewRequestWithContext(
-		op.Context(context.Background()),
+	req, err := retryablehttp.NewRequestWithContext(
+		op.Context(fs.beforeRunEndCtx),
 		http.MethodPost,
 		fs.baseURL.JoinPath(fs.path).String(),
 		bytes.NewReader(jsonData),

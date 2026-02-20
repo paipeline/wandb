@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/Khan/genqlient/graphql"
+
 	"github.com/wandb/wandb/core/internal/filestream"
 	"github.com/wandb/wandb/core/internal/filetransfer"
 	"github.com/wandb/wandb/core/internal/gql"
@@ -17,7 +19,6 @@ import (
 	"github.com/wandb/wandb/core/internal/runhandle"
 	"github.com/wandb/wandb/core/internal/runwork"
 	"github.com/wandb/wandb/core/internal/settings"
-	"github.com/wandb/wandb/core/internal/waiting"
 	"github.com/wandb/wandb/core/internal/watcher"
 	"github.com/wandb/wandb/core/internal/wboperation"
 
@@ -58,7 +59,7 @@ type uploader struct {
 
 func newUploader(
 	f *UploaderFactory,
-	batchDelay waiting.Delay,
+	batchDelay time.Duration,
 	extraWork runwork.ExtraWork,
 	fileStream filestream.FileStream,
 ) *uploader {
@@ -228,6 +229,7 @@ func (u *uploader) Finish() {
 	u.stateMu.Unlock()
 
 	// Flush any remaining upload batches.
+	u.uploadBatcher.Close()
 	u.uploadBatcher.Wait()
 
 	// Wait for all upload tasks to get scheduled.
@@ -250,6 +252,7 @@ func (u *uploader) FlushSchedulingForTest() {
 func (u *uploader) knownFile(runPath paths.RelativePath) *savedFile {
 	if u.knownFiles[runPath] == nil {
 		u.knownFiles[runPath] = newSavedFile(
+			u.extraWork.BeforeEndCtx(),
 			u.fs,
 			u.ftm,
 			u.logger,

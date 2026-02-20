@@ -27,7 +27,6 @@ import (
 	"github.com/wandb/wandb/core/internal/runwork"
 	"github.com/wandb/wandb/core/internal/settings"
 	"github.com/wandb/wandb/core/internal/sharedmode"
-	"github.com/wandb/wandb/core/internal/waiting"
 	"github.com/wandb/wandb/core/internal/watcher"
 	"github.com/wandb/wandb/core/internal/wboperation"
 	"github.com/wandb/wandb/core/pkg/artifacts"
@@ -42,11 +41,12 @@ var SenderProviders = wire.NewSet(
 
 // SenderFactory constructs a Sender.
 type SenderFactory struct {
+	BaseURL                 api.WBBaseURL
 	ClientID                sharedmode.ClientID
+	CredentialProvider      api.CredentialProvider
 	Logger                  *observability.CoreLogger
 	Operations              *wboperation.WandbOperations
 	Settings                *settings.Settings
-	Backend                 *api.Backend
 	FeatureProvider         *featurechecker.ServerFeaturesCache
 	FileStreamFactory       *fs.FileStreamFactory
 	FileTransferManager     filetransfer.FileTransferManager
@@ -136,18 +136,21 @@ func (f *SenderFactory) New(runWork runwork.RunWork) *Sender {
 	var fileStream fs.FileStream
 	if !f.Settings.IsOffline() {
 		fileStream = NewFileStream(
+			runWork,
 			f.FileStreamFactory,
-			f.Backend,
-			f.Settings,
-			f.Peeker,
+			f.BaseURL,
 			f.ClientID,
+			f.CredentialProvider,
+			f.Logger,
+			f.Peeker,
+			f.Settings,
 		)
 	}
 
 	var runfilesUploader runfiles.Uploader
 	if !f.Settings.IsOffline() {
 		runfilesUploader = f.RunfilesUploaderFactory.New(
-			/*batchDelay=*/ waiting.NewDelay(50*time.Millisecond),
+			/*batchDelay=*/ 5*time.Second,
 			runWork,
 			fileStream,
 		)
@@ -181,6 +184,7 @@ func (f *SenderFactory) New(runWork runwork.RunWork) *Sender {
 		runfilesUploader:    runfilesUploader,
 		artifactsSaver: artifacts.NewArtifactSaveManager(
 			f.Logger,
+			f.FileStreamFactory.Printer,
 			f.GraphqlClient,
 			f.FileTransferManager,
 			f.FeatureProvider.GetFeature(
@@ -197,8 +201,7 @@ func (f *SenderFactory) New(runWork runwork.RunWork) *Sender {
 		consoleLogsSender: runconsolelogs.New(consoleLogsSenderParams),
 	}
 
-	backendOrNil := f.Backend
-	if !s.settings.IsOffline() && backendOrNil != nil && !s.settings.IsJobCreationDisabled() {
+	if !s.settings.IsOffline() && !s.settings.IsJobCreationDisabled() {
 		s.jobBuilder = launch.NewJobBuilder(s.settings, s.logger, false)
 	}
 
@@ -213,7 +216,7 @@ func (h *Sender) ResponseChan() <-chan *spb.Result {
 // Do processes all work on the input channel.
 func (s *Sender) Do(allWork <-chan runwork.Work) {
 	defer s.logger.Reraise()
-	s.logger.Info("sender: started", "stream_id", s.settings.GetRunID())
+	s.logger.Info("sender: started")
 
 	hangDetectionInChan := make(chan runwork.Work, 32)
 	hangDetectionOutChan := make(chan struct{}, 32)
@@ -222,11 +225,7 @@ func (s *Sender) Do(allWork <-chan runwork.Work) {
 	for work := range allWork {
 		hangDetectionInChan <- work
 
-		s.logger.Debug(
-			"sender: got work",
-			"work", work,
-			"stream_id", s.settings.GetRunID(),
-		)
+		s.logger.Debug("sender: got work", "work", work)
 
 		s.mu.Lock()
 		work.Process(s.sendRecord, s.outChan)
@@ -239,7 +238,7 @@ func (s *Sender) Do(allWork <-chan runwork.Work) {
 	close(hangDetectionOutChan)
 
 	s.Close()
-	s.logger.Info("sender: closed", "stream_id", s.settings.GetRunID())
+	s.logger.Info("sender: closed")
 }
 
 // warnOnLongOperations logs a warning for each message received
@@ -879,13 +878,13 @@ func (s *Sender) scheduleFileUpload(
 	}
 	runPath := *maybeRunPath
 
-	if err = os.WriteFile(
+	if err := os.WriteFile(
 		filepath.Join(
 			s.settings.GetFilesDir(),
 			string(runPath),
 		),
 		content,
-		0644,
+		0o644,
 	); err != nil {
 		return err
 	}

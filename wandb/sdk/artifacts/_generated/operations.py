@@ -9,6 +9,7 @@ __all__ = [
     "ARTIFACT_COLLECTION_ALIASES_GQL",
     "ARTIFACT_CREATED_BY_GQL",
     "ARTIFACT_MEMBERSHIP_BY_NAME_GQL",
+    "ARTIFACT_TYPE_ARTIFACT_COLLECTIONS_GQL",
     "ARTIFACT_TYPE_GQL",
     "ARTIFACT_USED_BY_GQL",
     "CREATE_REGISTRY_MEMBERS_GQL",
@@ -21,6 +22,7 @@ __all__ = [
     "DELETE_REGISTRY_MEMBERS_GQL",
     "FETCH_ARTIFACT_MANIFEST_GQL",
     "FETCH_LINKED_ARTIFACTS_GQL",
+    "FETCH_ORG_ENTITY_FROM_ORGANIZATION_GQL",
     "FETCH_ORG_INFO_FROM_ENTITY_GQL",
     "FETCH_REGISTRIES_GQL",
     "FETCH_REGISTRY_GQL",
@@ -30,7 +32,6 @@ __all__ = [
     "GET_ARTIFACT_MEMBERSHIP_FILE_URLS_GQL",
     "LINK_ARTIFACT_GQL",
     "PROJECT_ARTIFACTS_GQL",
-    "PROJECT_ARTIFACT_COLLECTIONS_GQL",
     "PROJECT_ARTIFACT_COLLECTION_GQL",
     "PROJECT_ARTIFACT_TYPES_GQL",
     "PROJECT_ARTIFACT_TYPE_GQL",
@@ -90,6 +91,7 @@ fragment ArtifactCollectionFragment on ArtifactCollection {
   name
   description
   createdAt
+  updatedAt
   project {
     ...ProjectInfoFragment
   }
@@ -135,6 +137,7 @@ fragment ArtifactCollectionFragment on ArtifactCollection {
   name
   description
   createdAt
+  updatedAt
   project {
     ...ProjectInfoFragment
   }
@@ -180,6 +183,7 @@ fragment ArtifactCollectionFragment on ArtifactCollection {
   name
   description
   createdAt
+  updatedAt
   project {
     ...ProjectInfoFragment
   }
@@ -233,11 +237,16 @@ mutation DeleteArtifactCollectionTags($input: DeleteArtifactCollectionTagAssignm
 }
 """
 
-PROJECT_ARTIFACT_COLLECTIONS_GQL = """
-query ProjectArtifactCollections($entity: String!, $project: String!, $type: String!, $cursor: String, $perPage: Int) {
+ARTIFACT_TYPE_ARTIFACT_COLLECTIONS_GQL = """
+query ArtifactTypeArtifactCollections($entity: String!, $project: String!, $type: String!, $cursor: String, $perPage: Int, $filters: JSONString, $order: String) {
   project(entityName: $entity, name: $project) {
     artifactType(name: $type) {
-      artifactCollections(after: $cursor, first: $perPage) {
+      artifactCollections(
+        after: $cursor
+        first: $perPage
+        filters: $filters
+        order: $order
+      ) {
         totalCount
         pageInfo {
           ...PageInfoFragment
@@ -259,6 +268,7 @@ fragment ArtifactCollectionFragment on ArtifactCollection {
   name
   description
   createdAt
+  updatedAt
   project {
     ...ProjectInfoFragment
   }
@@ -312,6 +322,7 @@ fragment ArtifactCollectionFragment on ArtifactCollection {
   name
   description
   createdAt
+  updatedAt
   project {
     ...ProjectInfoFragment
   }
@@ -1479,6 +1490,16 @@ fragment OrgInfoFragment on Organization {
 }
 """
 
+FETCH_ORG_ENTITY_FROM_ORGANIZATION_GQL = """
+query FetchOrgEntityFromOrganization($organization: String!) {
+  organization(name: $organization) {
+    orgEntity {
+      name
+    }
+  }
+}
+"""
+
 REGISTRY_VERSIONS_GQL = """
 query RegistryVersions($organization: String!, $registryFilter: JSONString, $collectionFilter: JSONString, $artifactFilter: JSONString, $cursor: String, $perPage: Int, $includeAliases: Boolean = false) {
   organization(name: $organization) {
@@ -1640,6 +1661,7 @@ fragment RegistryCollectionFragment on ArtifactCollection {
   name
   description
   createdAt
+  updatedAt
   project {
     ...ProjectInfoFragment
   }

@@ -9,12 +9,13 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/prototext"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
 	"github.com/wandb/wandb/core/internal/leet"
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/transactionlog"
 	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
-	"google.golang.org/protobuf/encoding/prototext"
-	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
 // Verifies the missing-file path in NewWandbReader. reader.go
@@ -30,7 +31,7 @@ func TestParseHistory_StepAndMetrics(t *testing.T) {
 		{NestedKey: []string{"loss"}, ValueJson: "0.5"},
 		{NestedKey: []string{"_runtime"}, ValueJson: "1.2"},
 	}}
-	msg := leet.ParseHistory(h).(leet.HistoryMsg)
+	msg := leet.ParseHistory("/some/run/path", h).(leet.HistoryMsg)
 	require.Equal(t, 2.0, msg.Metrics["loss"].X[0])
 	require.Equal(t, 0.5, msg.Metrics["loss"].Y[0])
 }
@@ -222,7 +223,7 @@ func TestParseStats_ComplexMetrics(t *testing.T) {
 		},
 	}
 
-	msg := leet.ParseStats(stats).(leet.StatsMsg)
+	msg := leet.ParseStats("/some/run/path", stats).(leet.StatsMsg)
 
 	// Verify timestamp
 	require.Equal(t, int64(1234567890), msg.Timestamp)

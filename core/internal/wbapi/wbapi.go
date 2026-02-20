@@ -4,7 +4,6 @@
 package wbapi
 
 import (
-	"github.com/wandb/wandb/core/internal/sentry_ext"
 	"github.com/wandb/wandb/core/internal/settings"
 	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
 )
@@ -24,19 +23,13 @@ type WandbAPI struct {
 	settings *settings.Settings
 
 	runHistoryApiHandler *RunHistoryAPIHandler
-
-	sentryClient *sentry_ext.Client
 }
 
-func NewWandbAPI(
-	settings *settings.Settings,
-	sentryClient *sentry_ext.Client,
-) *WandbAPI {
+func NewWandbAPI(s *settings.Settings) *WandbAPI {
 	return &WandbAPI{
 		semaphore:            make(chan struct{}, maxConcurrency),
-		settings:             settings,
-		runHistoryApiHandler: NewRunHistoryAPIHandler(settings, sentryClient),
-		sentryClient:         sentryClient,
+		settings:             s,
+		runHistoryApiHandler: NewRunHistoryAPIHandler(s),
 	}
 }
 
@@ -52,8 +45,6 @@ func (p *WandbAPI) HandleRequest(
 	p.semaphore <- struct{}{}
 	defer func() { <-p.semaphore }()
 
-	// TODO: Implement request handling logic.
-	// For now respond with a place holder response.
 	if _, ok := request.Request.(*spb.ApiRequest_ReadRunHistoryRequest); ok {
 		return p.runHistoryApiHandler.HandleRequest(
 			request.GetReadRunHistoryRequest(),

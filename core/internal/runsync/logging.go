@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/getsentry/sentry-go"
+
 	"github.com/wandb/wandb/core/internal/fileutil"
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/settings"
@@ -41,9 +43,9 @@ func (f *DebugSyncLogFile) Close() {
 
 // OpenDebugSyncLogFile opens a file for writing wandb sync log messages.
 func OpenDebugSyncLogFile(
-	settings *settings.Settings,
+	s *settings.Settings,
 ) (*DebugSyncLogFile, error) {
-	dir := filepath.Join(settings.GetWandbDir(), "logs")
+	dir := filepath.Join(s.GetWandbDir(), "logs")
 
 	// 0o755: read-write-list for user; read-list for others.
 	err := os.MkdirAll(dir, 0o755)
@@ -80,6 +82,6 @@ func NewSyncLogger(
 				logFile.Writer(),
 				&slog.HandlerOptions{Level: logLevel},
 			)),
-		nil,
+		observability.NewSentryContext(sentry.CurrentHub()),
 	)
 }

@@ -6,8 +6,11 @@
 package runfiles
 
 import (
+	"time"
+
 	"github.com/Khan/genqlient/graphql"
 	"github.com/google/wire"
+
 	"github.com/wandb/wandb/core/internal/filestream"
 	"github.com/wandb/wandb/core/internal/filetransfer"
 	"github.com/wandb/wandb/core/internal/observability"
@@ -15,7 +18,6 @@ import (
 	"github.com/wandb/wandb/core/internal/runhandle"
 	"github.com/wandb/wandb/core/internal/runwork"
 	"github.com/wandb/wandb/core/internal/settings"
-	"github.com/wandb/wandb/core/internal/waiting"
 	"github.com/wandb/wandb/core/internal/watcher"
 	"github.com/wandb/wandb/core/internal/wboperation"
 	spb "github.com/wandb/wandb/core/pkg/service_go_proto"
@@ -75,8 +77,9 @@ type UploaderFactory struct {
 //
 // batchDelay is how long to wait to batch upload operations. Uploads scheduled
 // within this duration of each other are combined into a single GraphQL call.
+// It also affects how often "live" files are reuploaded.
 func (f *UploaderFactory) New(
-	batchDelay waiting.Delay,
+	batchDelay time.Duration,
 	extraWork runwork.ExtraWork,
 	fileStream filestream.FileStream,
 ) Uploader {

@@ -17,8 +17,9 @@ import json
 import logging
 import os
 import urllib
+from collections.abc import Iterator
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from pydantic import ValidationError
 from typing_extensions import Unpack, overload
@@ -52,6 +53,7 @@ from wandb.sdk.launch.utils import LAUNCH_DEFAULT_PROJECT
 from wandb.sdk.lib import retry, runid, wbauth
 from wandb.sdk.lib.deprecation import warn_and_record_deprecation
 from wandb.sdk.lib.gql_request import GraphQLSession
+from wandb.sdk.mailbox.mailbox_handle import MailboxHandle
 
 if TYPE_CHECKING:
     from wandb.automations import (
@@ -190,16 +192,25 @@ class Api:
         self.settings["base_url"] = self.settings["base_url"].rstrip("/")
 
         if api_key:
-            self.api_key = api_key
-        else:
-            self.api_key = self._load_api_key(
-                base_url=self.settings["base_url"],
+            self._auth = wbauth.AuthApiKey(
+                host=self.settings["base_url"],
+                api_key=api_key,
             )
+        else:
+            self._auth = self._load_auth(base_url=self.settings["base_url"])
 
-        wandb_login._verify_login(
-            key=self.api_key,
-            base_url=self.settings["base_url"],
-        )
+        base_url = self._auth.host.url
+
+        if isinstance(self._auth, wbauth.AuthApiKey):
+            self.api_key = self._auth.api_key
+            wandb_login._verify_login(
+                key=self.api_key,
+                base_url=base_url,
+            )
+        else:
+            self.api_key = None
+
+        session_auth = self._auth.as_requests_auth()
 
         self._viewer = None
         self._projects = {}
@@ -221,8 +232,8 @@ class Api:
                 # this timeout won't apply when the DNS lookup fails. in that case, it will be 60s
                 # https://bugs.python.org/issue22889
                 timeout=self._timeout,
-                auth=("api", self.api_key),
-                url="{}/graphql".format(self.settings["base_url"]),
+                auth=session_auth,
+                url="{}/graphql".format(base_url),
                 proxies=proxies,
             )
         )
@@ -246,8 +257,8 @@ class Api:
         self._service = singleton.ensure_service()
         self._service.api_init_request(self._settings.to_proto())
 
-    def _load_api_key(self, base_url: str) -> str:
-        """Load or prompt for an API key."""
+    def _load_auth(self, base_url: str) -> wbauth.Auth:
+        """Load or prompt for authentication credentials."""
         auth = wbauth.authenticate_session(
             host=base_url,
             source="wandb.Api()",
@@ -256,17 +267,11 @@ class Api:
         )
 
         if not auth:
-            raise UsageError("No API key configured. Use `wandb login` to log in.")
-        if not isinstance(auth, wbauth.AuthApiKey):
-            message = (
-                "wandb.Api() can only use API key authentication, but you have"
-                " another form of credentials configured."
-                " Check if you have set WANDB_IDENTITY_TOKEN_FILE."
-                f" Current credentials: {auth}"
+            raise UsageError(
+                "No authentication configured. Use `wandb login` to log in."
             )
-            raise UsageError(message)
 
-        return auth.api_key
+        return auth
 
     def _configure_sentry(self) -> None:
         if not env.error_reporting_enabled():
@@ -300,7 +305,7 @@ class Api:
         Creates the backend service attribute if it has not been created yet.
 
         TODO: remove this helper function once all requests are routed through wandb-core.
-        The backend service should be created and initalized
+        The backend service should be created and initialized
         during the instantiation of the Api object.
         """
         if self._service is None:
@@ -308,6 +313,23 @@ class Api:
 
         assert self._service is not None
         return self._service.api_request(request, timeout=timeout)
+
+    async def _send_api_request_async(
+        self,
+        request: ApiRequest,
+        timeout: float | None = None,
+    ) -> MailboxHandle[ApiResponse]:
+        """Sends an API request to the backend service asynchronously.
+
+        Args:
+            request: The API request to send.
+            timeout: The timeout for the request.
+        """
+        if self._service is None:
+            self._start_backend_service()
+
+        assert self._service is not None
+        return await self._service.api_request_async(request)
 
     def create_project(self, name: str, entity: str) -> None:
         """Create a new project.
@@ -806,38 +828,80 @@ class Api:
             return entity, path
         return parts
 
-    def _parse_path(self, path):
+    def _parse_path(self, path: str) -> tuple[str, str, str]:
         """Parse url, filepath, or docker paths.
 
         Allows paths in the following formats:
-        - url: entity/project/runs/id
-        - path: entity/project/id
-        - docker: entity/project:id
+        - entity/project/runs/id (URL)
+        - entity/project/id
+        - entity/project:id (Docker style)
+        - project/id
+        - project:id
+        - id (cannot contain colons)
 
-        Entity is optional and will fall back to the current logged-in user.
+        The path may also start with /runs/ or /sweeps/.
+
+        Returns:
+            A tuple with the extracted (entity, project, id).
+
+        Raises:
+            ValueError: If the path is in an invalid format or is missing
+                an entity that is not otherwise provided.
         """
-        project = self.settings["project"] or "uncategorized"
-        entity = self.settings["entity"] or self.default_entity
-        parts = (
-            path.replace("/runs/", "/").replace("/sweeps/", "/").strip("/ ").split("/")
-        )
-        if ":" in parts[-1]:
-            id = parts[-1].split(":")[-1]
-            parts[-1] = parts[-1].split(":")[0]
-        elif parts[-1]:
-            id = parts[-1]
-        if len(parts) == 1 and project != "uncategorized":
-            pass
-        elif len(parts) > 1:
-            project = parts[1]
-            if entity and id == project:
-                project = parts[0]
+        # NOTE: This may result in a GQL call. Ideally we'd only access
+        # `self.default_entity` lazily, but changing this requires care as it
+        # changes when `self._default_entity` is cached and could impact other
+        # code.
+        entity: str | None = self.settings["entity"] or self.default_entity
+        project: str | None = self.settings["project"]
+        id: str | None = None
+
+        input_path = path
+        path = path.replace("/runs/", "/")
+        path = path.replace("/sweeps/", "/")
+        path = path.strip("/ ")  # slashes and spaces
+
+        parts = path.split("/")
+
+        # "entity/project/runs/id"
+        if len(parts) == 4 and parts[2] == "runs":
+            entity, project, id = parts[0], parts[1], parts[3]
+
+        # "entity/project/id"
+        elif len(parts) == 3:
+            entity, project, id = parts[0], parts[1], parts[2]
+
+        elif len(parts) == 2:
+            # "entity/project:id"
+            if ":" in parts[1]:
+                entity = parts[0]
+                project, id = parts[1].split(":", maxsplit=1)
+
+            # "project/id"
             else:
-                entity = parts[0]
-            if len(parts) == 3:
-                entity = parts[0]
-        else:
-            project = parts[0]
+                project, id = parts[0], parts[1]
+
+        elif len(parts) == 1 and parts[0]:  # Don't match the empty string.
+            # "project:id"
+            if ":" in parts[0]:
+                project, id = parts[0].split(":", maxsplit=1)
+
+            # "id"
+            else:
+                id = parts[0]
+
+        # Ignore whitespace.
+        entity = entity and entity.strip()
+        project = project and project.strip()
+        id = id and id.strip()
+
+        if not entity:
+            raise ValueError(f"Invalid path: {input_path!r} (missing entity)")
+        if not project:
+            raise ValueError(f"Invalid path: {input_path!r} (missing project)")
+        if not id:
+            raise ValueError(f"Invalid path: {input_path!r}")
+
         return entity, project, id
 
     @overload
@@ -1411,13 +1475,13 @@ class Api:
         """Return an `Artifacts` collection.
 
         Args:
-        type_name: The type of artifacts to fetch.
-        name: The artifact's collection name. Optionally append the
-            entity that logged the artifact as a prefix followed by
-            a forward slash.
-        per_page: Sets the page size for query pagination. Usually
-            there is no reason to change this.
-        tags: Only return artifacts with all of these tags.
+            type_name: The type of artifacts to fetch.
+            name: The artifact's collection name. Optionally append the
+                entity that logged the artifact as a prefix followed by
+                a forward slash.
+            per_page: Sets the page size for query pagination. Usually
+                there is no reason to change this.
+            tags: Only return artifacts with all of these tags.
 
         Returns:
             An iterable `Artifacts` object.
@@ -1525,7 +1589,7 @@ class Api:
                 match the type of the fetched artifact.
 
         Examples:
-        In the proceeding code snippets "entity", "project", "artifact",
+        In the following code snippets "entity", "project", "artifact",
         "version", and "alias" are placeholders for your W&B entity, name
         of the project the artifact is in, the name of the artifact,
         and artifact's version, respectively.

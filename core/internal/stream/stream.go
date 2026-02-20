@@ -8,12 +8,12 @@ import (
 	"time"
 
 	"github.com/Khan/genqlient/graphql"
+
 	"github.com/wandb/wandb/core/internal/featurechecker"
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/pfxout"
 	"github.com/wandb/wandb/core/internal/runhandle"
 	"github.com/wandb/wandb/core/internal/runwork"
-	"github.com/wandb/wandb/core/internal/sentry_ext"
 	"github.com/wandb/wandb/core/internal/settings"
 	"github.com/wandb/wandb/core/internal/sharedmode"
 	"github.com/wandb/wandb/core/internal/tensorboard"
@@ -80,9 +80,6 @@ type Stream struct {
 	// dispatcher is the dispatcher for the stream
 	dispatcher *Dispatcher
 
-	// sentryClient is the client used to report errors to sentry.io
-	sentryClient *sentry_ext.Client
-
 	// clientID is a unique ID for the stream
 	clientID sharedmode.ClientID
 }
@@ -103,13 +100,12 @@ func NewStream(
 	operations *wboperation.WandbOperations,
 	recordParserFactory *RecordParserFactory,
 	senderFactory *SenderFactory,
-	sentry *sentry_ext.Client,
-	settings *settings.Settings,
+	s *settings.Settings,
 	runHandle *runhandle.RunHandle,
 	tbHandlerFactory *tensorboard.TBHandlerFactory,
 	writerFactory *WriterFactory,
 ) *Stream {
-	symlinkDebugCore(settings, string(debugCorePath))
+	symlinkDebugCore(s, string(debugCorePath))
 
 	runWork := runwork.New(BufferSize, logger)
 	tbHandler := tbHandlerFactory.New(
@@ -118,7 +114,7 @@ func NewStream(
 	)
 	recordParser := recordParserFactory.New(runWork.BeforeEndCtx(), tbHandler)
 
-	s := &Stream{
+	stream := &Stream{
 		runWork:            runWork,
 		runHandle:          runHandle,
 		operations:         operations,
@@ -126,20 +122,19 @@ func NewStream(
 		graphqlClientOrNil: graphqlClientOrNil,
 		logger:             logger,
 		loggerFile:         loggerFile,
-		settings:           settings,
+		settings:           s,
 		recordParser:       recordParser,
 		handler:            handlerFactory.New(runWork),
 		writerFactory:      writerFactory,
 		flowControlFactory: flowControlFactory,
 		sender:             senderFactory.New(runWork),
-		sentryClient:       sentry,
 		clientID:           clientID,
 	}
 
-	s.dispatcher = NewDispatcher(logger)
+	stream.dispatcher = NewDispatcher(logger)
 
-	logger.Info("stream: created new stream", "id", s.settings.GetRunID())
-	return s
+	logger.Info("stream: created new stream", "id", stream.settings.GetRunID())
+	return stream
 }
 
 // AddResponders adds the given responders to the stream's dispatcher.
@@ -182,7 +177,7 @@ func (s *Stream) Start() {
 		}(ch)
 	}
 
-	s.logger.Info("stream: started", "id", s.settings.GetRunID())
+	s.logger.Info("stream: started")
 }
 
 // maybeSavingToTransactionLog saves work from the channel into a transaction
@@ -193,17 +188,14 @@ func (s *Stream) maybeSavingToTransactionLog(
 	work <-chan runwork.Work,
 ) <-chan runwork.Work {
 	if s.settings.IsSkipTransactionLog() {
-		s.logger.Info(
-			"stream: skipping transaction log due to settings",
-			"id", s.settings.GetRunID())
+		s.logger.Info("stream: skipping transaction log due to settings")
 		return work
 	}
 
 	w, err := transactionlog.OpenWriter(s.settings.GetTransactionLogPath())
 	if err != nil {
-		s.logger.Error(
-			fmt.Sprintf("stream: error opening transaction log for writing: %v", err),
-			"id", s.settings.GetRunID())
+		s.logger.Error(fmt.Sprintf(
+			"stream: error opening transaction log for writing: %v", err))
 		return work
 	}
 
@@ -214,9 +206,8 @@ func (s *Stream) maybeSavingToTransactionLog(
 	if err != nil {
 		// Capture the error because if we can open for writing,
 		// why can't we open for reading?
-		s.logger.CaptureError(
-			fmt.Errorf("stream: error opening transaction log for reading: %v", err),
-			"id", s.settings.GetRunID())
+		s.logger.CaptureError(fmt.Errorf(
+			"stream: error opening transaction log for reading: %v", err))
 		return work
 	}
 
@@ -253,10 +244,10 @@ func (s *Stream) HandleRecord(record *spb.Record) {
 
 // Close waits for all run messages to be fully processed.
 func (s *Stream) Close() {
-	s.logger.Info("stream: closing", "id", s.settings.GetRunID())
+	s.logger.Info("stream: closing")
 	s.runWork.Close()
 	s.wg.Wait()
-	s.logger.Info("stream: closed", "id", s.settings.GetRunID())
+	s.logger.Info("stream: closed")
 
 	if s.loggerFile != nil {
 		// Sync the file instead of closing it, in case we keep writing to it.

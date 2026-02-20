@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/hashicorp/go-retryablehttp"
+
 	"github.com/wandb/wandb/core/internal/api"
 )
 
@@ -21,7 +23,7 @@ import (
 // Since the [api.Client] contract is very simple, it's not useful to use
 // a real object in tests.
 type FakeClient struct {
-	sync.Mutex
+	mu sync.Mutex
 
 	requestCountCond *sync.Cond
 
@@ -51,7 +53,7 @@ func NewFakeClient(baseURLString string) *FakeClient {
 		responseErr: fmt.Errorf("apitest: no response"),
 	}
 
-	client.requestCountCond = sync.NewCond(&client.Mutex)
+	client.requestCountCond = sync.NewCond(&client.mu)
 
 	return client
 }
@@ -63,8 +65,8 @@ type TestResponse struct {
 
 // SetResponse configures the client's response to all requests.
 func (c *FakeClient) SetResponse(resp *TestResponse, err error) {
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	c.responseErr = err
 	if resp == nil {
@@ -79,8 +81,8 @@ func (c *FakeClient) SetResponse(resp *TestResponse, err error) {
 
 // GetRequests returns all requests made to the fake client.
 func (c *FakeClient) GetRequests() []RequestCopy {
-	c.Lock()
-	defer c.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	return slices.Clone(c.requests)
 }
 
@@ -92,9 +94,9 @@ func (c *FakeClient) WaitUntilRequestCount(
 ) {
 	success := make(chan struct{})
 
-	c.Lock()
+	c.mu.Lock()
 	go func() {
-		defer c.Unlock()
+		defer c.mu.Unlock()
 		for len(c.requests) < n {
 			c.requestCountCond.Wait()
 		}
@@ -110,11 +112,11 @@ func (c *FakeClient) WaitUntilRequestCount(
 	}
 }
 
-var _ api.Client = &FakeClient{}
+var _ api.RetryableClient = &FakeClient{}
 
-func (c *FakeClient) Do(req *http.Request) (*http.Response, error) {
-	c.Lock()
-	defer c.Unlock()
+func (c *FakeClient) Do(req *retryablehttp.Request) (*http.Response, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	body, err := io.ReadAll(req.Body)
 	if err != nil {

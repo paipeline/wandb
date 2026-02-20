@@ -41,6 +41,7 @@ const (
 // ArtifactSaveManager manages artifact uploads.
 type ArtifactSaveManager struct {
 	logger                       *observability.CoreLogger
+	printer                      *observability.Printer
 	graphqlClient                graphql.Client
 	fileTransferManager          filetransfer.FileTransferManager
 	fileCache                    Cache
@@ -53,6 +54,7 @@ type ArtifactSaveManager struct {
 
 func NewArtifactSaveManager(
 	logger *observability.CoreLogger,
+	printer *observability.Printer,
 	graphqlClient graphql.Client,
 	fileTransferManager filetransfer.FileTransferManager,
 	useArtifactProjectEntityInfo bool,
@@ -62,6 +64,7 @@ func NewArtifactSaveManager(
 
 	return &ArtifactSaveManager{
 		logger:                       logger,
+		printer:                      printer,
 		graphqlClient:                graphqlClient,
 		fileTransferManager:          fileTransferManager,
 		fileCache:                    NewFileCache(UserCacheDir()),
@@ -104,6 +107,7 @@ func (as *ArtifactSaveManager) Save(
 		&ArtifactSaver{
 			ctx:                          ctx,
 			logger:                       as.logger,
+			printer:                      as.printer,
 			graphqlClient:                as.graphqlClient,
 			fileTransferManager:          as.fileTransferManager,
 			fileCache:                    as.fileCache,
@@ -124,6 +128,7 @@ type ArtifactSaver struct {
 	// Resources.
 	ctx                 context.Context
 	logger              *observability.CoreLogger
+	printer             *observability.Printer
 	graphqlClient       graphql.Client
 	fileTransferManager filetransfer.FileTransferManager
 	fileCache           Cache
@@ -293,7 +298,12 @@ func (as *ArtifactSaver) upsertManifest(
 		}
 		return updateManifestAttrs.File.UploadUrl, updateManifestAttrs.File.UploadHeaders, nil
 	} else {
-		manifestAttrs, err := as.createManifest(artifactId, baseArtifactId, manifestDigest, true /* includeUpload */)
+		manifestAttrs, err := as.createManifest(
+			artifactId,
+			baseArtifactId,
+			manifestDigest,
+			true, /* includeUpload */
+		)
 		if err != nil {
 			return nil, nil, fmt.Errorf("ArtifactSaver.createManifest: %w", err)
 		}
@@ -632,32 +642,34 @@ func (as *ArtifactSaver) cacheEntry(entry ManifestEntry) {
 func (as *ArtifactSaver) resolveClientIDReferences(manifest *Manifest) error {
 	cache := map[string]string{}
 	for name, entry := range manifest.Contents {
-		if entry.Ref != nil && strings.HasPrefix(*entry.Ref, "wandb-client-artifact:") {
-			refParsed, err := url.Parse(*entry.Ref)
-			if err != nil {
-				return err
-			}
-			clientId, path := refParsed.Host, strings.TrimPrefix(refParsed.Path, "/")
-			serverId, ok := cache[clientId]
-			if !ok {
-				response, err := gql.ClientIDMapping(as.ctx, as.graphqlClient, clientId)
-				if err != nil {
-					return err
-				}
-				if response.ClientIDMapping == nil {
-					return fmt.Errorf("could not resolve client id %v", clientId)
-				}
-				serverId = response.ClientIDMapping.ServerID
-				cache[clientId] = serverId
-			}
-			serverIdHex, err := hashencode.B64ToHex(serverId)
-			if err != nil {
-				return err
-			}
-			resolvedRef := "wandb-artifact://" + serverIdHex + "/" + path
-			entry.Ref = &resolvedRef
-			manifest.Contents[name] = entry
+		if entry.Ref == nil || !strings.HasPrefix(*entry.Ref, "wandb-client-artifact:") {
+			continue
 		}
+		refParsed, err := url.Parse(*entry.Ref)
+		if err != nil {
+			return err
+		}
+		clientId, path := refParsed.Host, strings.TrimPrefix(refParsed.Path, "/")
+		serverId, ok := cache[clientId]
+		if !ok {
+			response, err := gql.ClientIDMapping(as.ctx, as.graphqlClient, clientId)
+			if err != nil {
+				return err
+			}
+			if response.ClientIDMapping == nil {
+				return fmt.Errorf("could not resolve client id %v", clientId)
+			}
+			serverId = response.ClientIDMapping.ServerID
+			cache[clientId] = serverId
+		}
+		serverIdHex, err := hashencode.B64ToHex(serverId)
+		if err != nil {
+			return err
+		}
+		resolvedRef := "wandb-artifact://" + serverIdHex + "/" + path
+		entry.Ref = &resolvedRef
+		manifest.Contents[name] = entry
+
 	}
 	return nil
 }
@@ -698,7 +710,7 @@ func (as *ArtifactSaver) deleteStagingFiles(manifest *Manifest) {
 	for _, entry := range manifest.Contents {
 		if entry.LocalPath != nil && strings.HasPrefix(*entry.LocalPath, as.stagingDir) {
 			// We intentionally ignore errors below.
-			_ = os.Chmod(*entry.LocalPath, 0600)
+			_ = os.Chmod(*entry.LocalPath, 0o600)
 			_ = os.Remove(*entry.LocalPath)
 		}
 	}
@@ -751,6 +763,12 @@ func (as *ArtifactSaver) Save() (artifactID string, rerr error) {
 				return "", fmt.Errorf("gql.UseArtifact: %w", err)
 			}
 		}
+		as.printer.
+			AtMostEvery(time.Minute).
+			Warnf(
+				"Artifact %q already exists with the same content. No new version will be created.",
+				as.artifact.Name,
+			)
 		return artifactID, nil
 	}
 	// DELETED is for old servers, see https://github.com/wandb/wandb/pull/6190

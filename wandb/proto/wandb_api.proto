@@ -3,6 +3,7 @@ syntax = "proto3";
 package wandb_internal;
 
 import "wandb/proto/wandb_settings.proto";
+import "wandb/proto/wandb_internal.proto";
 
 option go_package = "core/pkg/service_go_proto";
 
@@ -30,12 +31,19 @@ message ServerApiInitResponse {
 message ApiResponse {
   oneof response {
     ReadRunHistoryResponse read_run_history_response = 1;
+
     ApiErrorResponse api_error_response = 2;
   }
 }
 
 message ApiErrorResponse {
   string message = 1;
+  optional ErrorType error_type = 2;
+}
+
+enum ErrorType {
+  UNKNOWN_ERROR = 0;
+  INCOMPLETE_RUN_HISTORY_ERROR = 1;
 }
 
 // Start of Scan run history
@@ -45,6 +53,10 @@ message ReadRunHistoryRequest {
     ScanRunHistoryInit scan_run_history_init = 1;
     ScanRunHistory scan_run_history = 2;
     ScanRunHistoryCleanup scan_run_history_cleanup = 3;
+
+    DownloadRunHistoryInit download_run_history_init = 4;
+    DownloadRunHistory download_run_history = 5;
+    DownloadRunHistoryStatus download_run_history_status = 6;
   }
 }
 
@@ -53,6 +65,10 @@ message ReadRunHistoryResponse {
     ScanRunHistoryInitResponse scan_run_history_init = 1;
     RunHistoryResponse run_history = 2;
     ScanRunHistoryCleanupResponse scan_run_history_cleanup = 3;
+
+    DownloadRunHistoryInitResponse download_run_history_init = 4;
+    DownloadRunHistoryResponse download_run_history = 5;
+    DownloadRunHistoryStatusResponse download_run_history_status = 6;
   }
 }
 
@@ -104,3 +120,63 @@ message ScanRunHistoryCleanup {
 message ScanRunHistoryCleanupResponse {}
 
 // End of Scan run history
+
+// Download run history
+
+message DownloadRunHistoryInit {
+  // The entity who owns the run.
+  string entity = 1;
+  // The project that the run belongs to.
+  string project = 2;
+  // The ID of the run.
+  string run_id = 3;
+
+  // The directory to store the downloaded history files within.
+  string download_dir = 4;
+
+  // Whether to require the complete history to be downloaded.
+  // If the run contains data that has not been exported to parquet files yet,
+  // the run history will be considered incomplete.
+  bool require_complete_history = 5;
+}
+
+message DownloadRunHistoryInitResponse {
+  // The request id of the download operation.
+  //
+  // This is used to identify the download operation,
+  // and request status updates of the download operation.
+  int32 request_id = 1;
+
+  // Whether the run contains live data not yet exported to parquet.
+  bool contains_live_data = 2;
+}
+
+// A request to start a download operation for a run's history exports.
+message DownloadRunHistory {
+  // The request id of the download operation.
+  int32 request_id = 1;
+}
+
+// A response to a DownloadRunHistoryStart request.
+message DownloadRunHistoryResponse {
+  // Files that have been successfully downloaded.
+  repeated string downloaded_files = 1;
+
+  // Map of file paths to error messages for failed downloads.
+  map<string, string> errors = 2;
+}
+
+// IncompleteRunHistoryError is an error that is returned when the run history
+// has live data that has not been exported to parquet files yet.
+message IncompleteRunHistoryError {}
+
+// DownloadRunHistoryStatus requests the status of an ongoing download operation.
+message DownloadRunHistoryStatus {
+  // The request id of an ongoing download operation.
+  int32 request_id = 1;
+}
+
+message DownloadRunHistoryStatusResponse {
+  // Operation stats for progress display.
+  wandb_internal.OperationStats operation_stats = 1;
+}

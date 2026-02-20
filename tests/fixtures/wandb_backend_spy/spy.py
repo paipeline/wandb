@@ -4,7 +4,8 @@ import contextlib
 import dataclasses
 import json
 import threading
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import fastapi
 from typing_extensions import NamedTuple
@@ -195,6 +196,10 @@ class WandbBackendSpy:
         config = variables.get("config")
         if config is not None:
             run._config_json_string = config
+
+        job_type = variables.get("jobType")
+        if job_type is not None:
+            run._job_type = job_type
 
         tags = variables.get("tags")
         if tags is not None:
@@ -400,6 +405,18 @@ class WandbBackendSnapshot:
         except KeyError as e:
             raise AssertionError(f"No metrics for run {run_id}") from e
 
+    def job_type(self, *, run_id: str) -> list[str]:
+        """Returns the run's job type.
+
+        Args:
+            run_id: The ID of the run.
+
+        Raises:
+            KeyError: if the run does not exist.
+        """
+        spy = self._assert_valid()
+        return spy._runs.get(run_id)._job_type
+
     def tags(self, *, run_id: str) -> list[str]:
         """Returns the run's tags.
 
@@ -552,6 +569,7 @@ class _RunData:
         self._uploaded_files: set[str] = set()
         self._file_stream_files: dict[str, dict[int, str]] = {}
         self._config_json_string: str | None = None
+        self._job_type: str | None = None
         self._tags: list[str] = []
         self._remote: str | None = None
         self._commit: str | None = None

@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import logging
 import sys
 import warnings
-from typing import Literal, Optional
+from typing import Literal
 
 import wandb
 
@@ -71,6 +73,20 @@ def in_notebook() -> bool:
     return _get_python_type() != "python"
 
 
+def in_vscode_notebook() -> bool:
+    """Returns True if we're in a VSCode notebook."""
+    try:
+        from IPython import get_ipython
+    except ModuleNotFoundError:
+        return False
+
+    ipython = get_ipython()
+    if not ipython:
+        return False
+
+    return ipython.kernel.shell.user_ns.get("__vsc_ipynb_file__") is not None
+
+
 class ProgressWidget:
     """A simple wrapper to render a nice progress bar with a label."""
 
@@ -108,7 +124,7 @@ class ProgressWidget:
         self._widget.close()
 
 
-def jupyter_progress_bar(min: float = 0, max: float = 1.0) -> Optional[ProgressWidget]:
+def jupyter_progress_bar(min: float = 0, max: float = 1.0) -> ProgressWidget | None:
     """Return an ipywidget progress bar or None if we can't import it."""
     widgets = wandb.util.get_module("ipywidgets")
     try:

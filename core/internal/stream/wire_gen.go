@@ -17,7 +17,6 @@ import (
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/runfiles"
 	"github.com/wandb/wandb/core/internal/runhandle"
-	"github.com/wandb/wandb/core/internal/sentry_ext"
 	"github.com/wandb/wandb/core/internal/settings"
 	"github.com/wandb/wandb/core/internal/sharedmode"
 	"github.com/wandb/wandb/core/internal/tensorboard"
@@ -29,22 +28,24 @@ import (
 // Injectors from streaminject.go:
 
 // InjectStream returns a new Stream.
-func InjectStream(commit GitCommitHash, gpuResourceManager *monitor.GPUResourceManager, debugCorePath DebugCorePath, logLevel slog.Level, sentry *sentry_ext.Client, settings2 *settings.Settings) *Stream {
+func InjectStream(commit GitCommitHash, gpuResourceManager *monitor.GPUResourceManager, debugCorePath DebugCorePath, logLevel slog.Level, settings2 *settings.Settings) *Stream {
 	clientID := sharedmode.RandomClientID()
 	streamStreamLoggerFile := openStreamLoggerFile(settings2)
-	coreLogger := streamLogger(streamStreamLoggerFile, settings2, sentry, logLevel)
+	sentryContext := streamSentryContext(settings2)
+	coreLogger := streamLogger(streamStreamLoggerFile, sentryContext, settings2, logLevel)
 	wbBaseURL := BaseURLFromSettings(coreLogger, settings2)
-	backend := NewBackend(wbBaseURL, coreLogger, settings2)
+	credentialProvider := CredentialsFromSettings(coreLogger, settings2)
 	peeker := &observability.Peeker{}
-	client := NewGraphQLClient(backend, settings2, peeker, clientID)
+	client := NewGraphQLClient(wbBaseURL, clientID, credentialProvider, coreLogger, peeker, settings2)
 	serverFeaturesCache := featurechecker.NewServerFeaturesCache(client, coreLogger)
+	runHandle := runhandle.New()
 	flowControlFactory := &FlowControlFactory{
-		Logger: coreLogger,
+		Logger:    coreLogger,
+		RunHandle: runHandle,
 	}
 	fileTransferStats := filetransfer.NewFileTransferStats()
 	mailboxMailbox := mailbox.New()
 	wandbOperations := wboperation.NewOperations()
-	runHandle := runhandle.New()
 	systemMonitorFactory := &monitor.SystemMonitorFactory{
 		Logger:             coreLogger,
 		RunHandle:          runHandle,
@@ -80,7 +81,7 @@ func InjectStream(commit GitCommitHash, gpuResourceManager *monitor.GPUResourceM
 		Printer:    printer,
 		Settings:   settings2,
 	}
-	fileTransferManager := NewFileTransferManager(fileTransferStats, coreLogger, settings2)
+	fileTransferManager := NewFileTransferManager(wbBaseURL, fileTransferStats, coreLogger, settings2)
 	watcher := provideFileWatcher(coreLogger)
 	uploaderFactory := &runfiles.UploaderFactory{
 		FileTransfer: fileTransferManager,
@@ -92,11 +93,12 @@ func InjectStream(commit GitCommitHash, gpuResourceManager *monitor.GPUResourceM
 		Settings:     settings2,
 	}
 	senderFactory := &SenderFactory{
+		BaseURL:                 wbBaseURL,
 		ClientID:                clientID,
+		CredentialProvider:      credentialProvider,
 		Logger:                  coreLogger,
 		Operations:              wandbOperations,
 		Settings:                settings2,
-		Backend:                 backend,
 		FeatureProvider:         serverFeaturesCache,
 		FileStreamFactory:       fileStreamFactory,
 		FileTransferManager:     fileTransferManager,
@@ -116,16 +118,16 @@ func InjectStream(commit GitCommitHash, gpuResourceManager *monitor.GPUResourceM
 		Logger:   coreLogger,
 		Settings: settings2,
 	}
-	stream := NewStream(clientID, debugCorePath, serverFeaturesCache, flowControlFactory, client, handlerFactory, streamStreamLoggerFile, coreLogger, wandbOperations, recordParserFactory, senderFactory, sentry, settings2, runHandle, tbHandlerFactory, writerFactory)
+	stream := NewStream(clientID, debugCorePath, serverFeaturesCache, flowControlFactory, client, handlerFactory, streamStreamLoggerFile, coreLogger, wandbOperations, recordParserFactory, senderFactory, settings2, runHandle, tbHandlerFactory, writerFactory)
 	return stream
 }
 
 // streaminject.go:
 
 var streamProviders = wire.NewSet(
-	NewStream, wire.Bind(new(api.Peeker), new(*observability.Peeker)), wire.Struct(new(observability.Peeker)), BaseURLFromSettings, featurechecker.NewServerFeaturesCache, filestream.FileStreamProviders, filetransfer.NewFileTransferStats, flowControlProviders,
-	handlerProviders, mailbox.New, monitor.SystemMonitorProviders, NewBackend,
-	NewFileTransferManager,
+	NewStream, wire.Bind(new(api.Peeker), new(*observability.Peeker)), wire.Struct(new(observability.Peeker)), BaseURLFromSettings,
+	CredentialsFromSettings, featurechecker.NewServerFeaturesCache, filestream.FileStreamProviders, filetransfer.NewFileTransferStats, flowControlProviders,
+	handlerProviders, mailbox.New, monitor.SystemMonitorProviders, NewFileTransferManager,
 	NewGraphQLClient, observability.NewPrinter, provideFileWatcher,
 	RecordParserProviders, runfiles.UploaderProviders, runhandle.New, SenderProviders, sharedmode.RandomClientID, streamLoggerProviders, tensorboard.TBHandlerProviders, wboperation.NewOperations, WriterProviders,
 )

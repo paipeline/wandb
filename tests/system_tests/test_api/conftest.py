@@ -7,7 +7,7 @@ import io
 import socket
 import socketserver
 import threading
-from typing import Generator
+from collections.abc import Generator
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -19,7 +19,7 @@ class ParquetFileHandler(http.server.SimpleHTTPRequestHandler):
 
     parquet_files: dict[str, bytes] = {}
 
-    def do_GET(self):  # noqa: N802
+    def do_GET(self):
         path = self.path.lstrip("/")
 
         if path in self.parquet_files:

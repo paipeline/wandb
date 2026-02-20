@@ -1,6 +1,7 @@
 package runsync
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/wire"
+
 	"github.com/wandb/wandb/core/internal/observability"
 	"github.com/wandb/wandb/core/internal/runwork"
 	"github.com/wandb/wandb/core/internal/stream"
@@ -64,8 +66,8 @@ func (f *RunReaderFactory) New(
 }
 
 // ExtractRunInfo reads and returns basic run information.
-func (r *RunReader) ExtractRunInfo() (*RunInfo, error) {
-	r.logger.Info("runsync: getting info", "path", r.path)
+func (r *RunReader) ExtractRunInfo(ctx context.Context) (*RunInfo, error) {
+	r.logger.Info("runsync: getting info")
 
 	reader, err := r.open()
 	if err != nil {
@@ -74,7 +76,13 @@ func (r *RunReader) ExtractRunInfo() (*RunInfo, error) {
 	defer reader.Close()
 
 	for {
-		record, err := r.nextUpdatedRecord(reader, true /*retryEOF*/)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+
+		record, err := r.nextUpdatedRecord(ctx, reader, true /*retryEOF*/)
 
 		if err != nil {
 			return nil, &SyncError{
@@ -101,8 +109,12 @@ func (r *RunReader) ExtractRunInfo() (*RunInfo, error) {
 //
 // Closes RunWork at the end, even on error. If there was no Exit record,
 // creates one with an exit code of 1.
-func (r *RunReader) ProcessTransactionLog() error {
-	r.logger.Info("runsync: starting to read", "path", r.path)
+func (r *RunReader) ProcessTransactionLog(ctx context.Context) error {
+	r.logger.Info("runsync: starting to read")
+
+	// Abort any async work on cancellation.
+	cancelAbort := context.AfterFunc(ctx, r.runWork.Abort)
+	defer cancelAbort() // must run after closeRunWork()
 
 	defer r.closeRunWork()
 
@@ -113,10 +125,10 @@ func (r *RunReader) ProcessTransactionLog() error {
 	defer reader.Close()
 
 	for {
-		record, err := r.nextUpdatedRecord(reader, !r.seenExit /*retryEOF*/)
+		record, err := r.nextUpdatedRecord(ctx, reader, !r.seenExit /*retryEOF*/)
 
 		if errors.Is(err, io.EOF) {
-			r.logger.Info("runsync: done reading", "path", r.path)
+			r.logger.Info("runsync: done reading")
 			return nil
 		}
 
@@ -149,18 +161,17 @@ func (r *RunReader) ProcessTransactionLog() error {
 func (r *RunReader) closeRunWork() {
 	if !r.seenExit {
 		r.logger.Warn(
-			"runsync: no exit record in file, using exit code 1 (failed)",
-			"path", r.path)
+			"runsync: no exit record encountered, using exit code 1 (failed)",
+		)
 
-		exitRecord := &spb.Record{
-			RecordType: &spb.Record_Exit{
-				Exit: &spb.RunExitRecord{
-					ExitCode: 1,
+		r.parseAndAddWork(
+			&spb.Record{
+				RecordType: &spb.Record_Exit{
+					Exit: &spb.RunExitRecord{
+						ExitCode: 1,
+					},
 				},
-			},
-		}
-
-		r.runWork.AddWork(r.recordParser.Parse(exitRecord))
+			})
 	}
 
 	r.runWork.Close()
@@ -198,6 +209,7 @@ func (r *RunReader) open() (*transactionlog.Reader, error) {
 //
 // Retries ErrUnexpectedEOF in live mode, and also EOF if retryEOF is true.
 func (r *RunReader) nextUpdatedRecord(
+	ctx context.Context,
 	reader *transactionlog.Reader,
 	retryEOF bool,
 ) (record *spb.Record, err error) {
@@ -211,15 +223,23 @@ func (r *RunReader) nextUpdatedRecord(
 			(retryEOF && errors.Is(err, io.EOF)) {
 			r.logger.Info(
 				"runsync: retrying read error in live mode",
-				"path", r.path,
 				"error", err)
 
 			if err := reader.ResetLastRead(); err != nil {
 				return nil, fmt.Errorf("failed to seek: %v", err)
 			}
 
+			select {
+			case <-ctx.Done():
+				// NOTE: We don't wrap the original error with errors.Join(...)
+				// because the caller interprets errors. An EOF that we stopped
+				// retrying because of cancellation should not be treated like
+				// a normal EOF.
+				return nil, ctx.Err()
+
 			// TODO: Use FS event mechanisms when available instead of polling.
-			time.Sleep(time.Second)
+			case <-time.After(time.Second):
+			}
 			record, err = reader.Read()
 		}
 	}
@@ -237,6 +257,10 @@ func (r *RunReader) parseAndAddWork(record *spb.Record) {
 	work := r.recordParser.Parse(record)
 
 	wg := &sync.WaitGroup{}
+
+	// NOTE: Don't use AddWorkOrCancel to avoid setting seenExit for
+	// an Exit record that was never sent. We rely on RunWork.Abort()
+	// quickly unblocking the pipeline if the operation is cancelled.
 	work.Schedule(wg, func() { r.runWork.AddWork(work) })
 
 	// We always process records in reading order.
